@@ -293,7 +293,8 @@ struct WhisperModel final : public transcribe_model {
     Tokenizer      tok;
     WhisperHParams hparams;
     WhisperWeights weights;
-    ggml_context * ctx_meta = nullptr;
+    ggml_context * ctx_meta     = nullptr;
+    bool           decoder_only = false;
 
     // Runtime backend plan. See transcribe-backend.h.
     transcribe::BackendPlan plan;

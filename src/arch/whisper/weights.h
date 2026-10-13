@@ -183,7 +183,10 @@ struct WhisperWeights {
     std::vector<WhisperDecBlock> dec_blocks;
 };
 
-transcribe_status build_whisper_weights(ggml_context * ctx_meta, const WhisperHParams & hp, WhisperWeights & weights);
+transcribe_status build_whisper_weights(ggml_context *         ctx_meta,
+                                        const WhisperHParams & hp,
+                                        WhisperWeights &       weights,
+                                        bool                   include_encoder = true);
 
 // Build a MelConfig from `hp`, install the caller-provided
 // `filterbank` + `window` buffers (either may be empty — MelFrontend

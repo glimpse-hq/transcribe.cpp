@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["gguf>=0.17"]
 # ///
-"""Extract the decoder of a Parakeet TDT V3 or Qwen3-ASR GGUF for use with its Core ML encoder."""
+"""Extract the decoder of a Parakeet TDT V3, Qwen3-ASR or Whisper GGUF for use with its Core ML encoder."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -19,7 +19,7 @@ def extract(source: Path, output: Path):
         if reader.fields["stt.variant"].contents() != "tdt-0.6b-v3":
             raise ValueError("Only Parakeet TDT 0.6B V3 is supported")
         decoder_prefixes = ("pred.", "joint.")
-    elif arch == "qwen3_asr":
+    elif arch in ("qwen3_asr", "whisper"):
         decoder_prefixes = ("dec.", "frontend.")
     else:
         raise ValueError(f"Unsupported architecture: {arch}")

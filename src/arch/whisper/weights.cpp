@@ -508,7 +508,10 @@ constexpr const char * kTag = kFamilyTag;
 
 }  // namespace
 
-transcribe_status build_whisper_weights(ggml_context * ctx_meta, const WhisperHParams & hp, WhisperWeights & weights) {
+transcribe_status build_whisper_weights(ggml_context *         ctx_meta,
+                                        const WhisperHParams & hp,
+                                        WhisperWeights &       weights,
+                                        bool                   include_encoder) {
     if (ctx_meta == nullptr) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -527,42 +530,44 @@ transcribe_status build_whisper_weights(ggml_context * ctx_meta, const WhisperHP
     GET_F32(weights.frontend.mel_filterbank, "frontend.mel_filterbank", n_fft_half, n_mel);
     GET_F32(weights.frontend.window, "frontend.window", hp.fe_n_fft);
 
-    // ----- encoder conv stem -----
-    // Conv1d kernels: PyTorch [out, in, K] -> ggml ne=[K, in, out].
-    GET_CONV(weights.enc_stem.conv0_w, "enc.conv.0.weight", 3, n_mel, d_model);
-    GET_F32(weights.enc_stem.conv0_b, "enc.conv.0.bias", d_model);
-    GET_CONV(weights.enc_stem.conv1_w, "enc.conv.1.weight", 3, d_model, d_model);
-    GET_F32(weights.enc_stem.conv1_b, "enc.conv.1.bias", d_model);
+    if (include_encoder) {
+        // ----- encoder conv stem -----
+        // Conv1d kernels: PyTorch [out, in, K] -> ggml ne=[K, in, out].
+        GET_CONV(weights.enc_stem.conv0_w, "enc.conv.0.weight", 3, n_mel, d_model);
+        GET_F32(weights.enc_stem.conv0_b, "enc.conv.0.bias", d_model);
+        GET_CONV(weights.enc_stem.conv1_w, "enc.conv.1.weight", 3, d_model, d_model);
+        GET_F32(weights.enc_stem.conv1_b, "enc.conv.1.bias", d_model);
 
-    // ----- encoder top (pos emb + final LN) -----
-    // pos_emb is nn.Embedding weight [max_source_positions, d_model] ->
-    // ggml ne = [d_model, max_source_positions].
-    GET_F32(weights.enc_top.pos_emb_w, "enc.pos_emb.weight", d_model, src_pos);
-    GET_F32(weights.enc_top.final_norm_w, "enc.final_norm.weight", d_model);
-    GET_F32(weights.enc_top.final_norm_b, "enc.final_norm.bias", d_model);
+        // ----- encoder top (pos emb + final LN) -----
+        // pos_emb is nn.Embedding weight [max_source_positions, d_model] ->
+        // ggml ne = [d_model, max_source_positions].
+        GET_F32(weights.enc_top.pos_emb_w, "enc.pos_emb.weight", d_model, src_pos);
+        GET_F32(weights.enc_top.final_norm_w, "enc.final_norm.weight", d_model);
+        GET_F32(weights.enc_top.final_norm_b, "enc.final_norm.bias", d_model);
 
-    // ----- encoder blocks -----
-    weights.enc_blocks.assign(hp.enc_n_layers, WhisperEncBlock{});
-    for (int i = 0; i < hp.enc_n_layers; ++i) {
-        auto & b = weights.enc_blocks[i];
+        // ----- encoder blocks -----
+        weights.enc_blocks.assign(hp.enc_n_layers, WhisperEncBlock{});
+        for (int i = 0; i < hp.enc_n_layers; ++i) {
+            auto & b = weights.enc_blocks[i];
 
-        GET_F32(b.norm_attn_w, lname("enc.blocks.%d.norm_attn.weight", i), d_model);
-        GET_F32(b.norm_attn_b, lname("enc.blocks.%d.norm_attn.bias", i), d_model);
+            GET_F32(b.norm_attn_w, lname("enc.blocks.%d.norm_attn.weight", i), d_model);
+            GET_F32(b.norm_attn_b, lname("enc.blocks.%d.norm_attn.bias", i), d_model);
 
-        GET_LIN(b.attn_q_w, lname("enc.blocks.%d.attn.q.weight", i), d_model, d_model);
-        GET_F32(b.attn_q_b, lname("enc.blocks.%d.attn.q.bias", i), d_model);
-        GET_LIN(b.attn_k_w, lname("enc.blocks.%d.attn.k.weight", i), d_model, d_model);  // no bias
-        GET_LIN(b.attn_v_w, lname("enc.blocks.%d.attn.v.weight", i), d_model, d_model);
-        GET_F32(b.attn_v_b, lname("enc.blocks.%d.attn.v.bias", i), d_model);
-        GET_LIN(b.attn_out_w, lname("enc.blocks.%d.attn.out.weight", i), d_model, d_model);
-        GET_F32(b.attn_out_b, lname("enc.blocks.%d.attn.out.bias", i), d_model);
+            GET_LIN(b.attn_q_w, lname("enc.blocks.%d.attn.q.weight", i), d_model, d_model);
+            GET_F32(b.attn_q_b, lname("enc.blocks.%d.attn.q.bias", i), d_model);
+            GET_LIN(b.attn_k_w, lname("enc.blocks.%d.attn.k.weight", i), d_model, d_model);  // no bias
+            GET_LIN(b.attn_v_w, lname("enc.blocks.%d.attn.v.weight", i), d_model, d_model);
+            GET_F32(b.attn_v_b, lname("enc.blocks.%d.attn.v.bias", i), d_model);
+            GET_LIN(b.attn_out_w, lname("enc.blocks.%d.attn.out.weight", i), d_model, d_model);
+            GET_F32(b.attn_out_b, lname("enc.blocks.%d.attn.out.bias", i), d_model);
 
-        GET_F32(b.norm_ffn_w, lname("enc.blocks.%d.norm_ffn.weight", i), d_model);
-        GET_F32(b.norm_ffn_b, lname("enc.blocks.%d.norm_ffn.bias", i), d_model);
-        GET_LIN(b.ffn_fc1_w, lname("enc.blocks.%d.ffn.fc1.weight", i), d_model, enc_ff);
-        GET_F32(b.ffn_fc1_b, lname("enc.blocks.%d.ffn.fc1.bias", i), enc_ff);
-        GET_LIN(b.ffn_fc2_w, lname("enc.blocks.%d.ffn.fc2.weight", i), enc_ff, d_model);
-        GET_F32(b.ffn_fc2_b, lname("enc.blocks.%d.ffn.fc2.bias", i), d_model);
+            GET_F32(b.norm_ffn_w, lname("enc.blocks.%d.norm_ffn.weight", i), d_model);
+            GET_F32(b.norm_ffn_b, lname("enc.blocks.%d.norm_ffn.bias", i), d_model);
+            GET_LIN(b.ffn_fc1_w, lname("enc.blocks.%d.ffn.fc1.weight", i), d_model, enc_ff);
+            GET_F32(b.ffn_fc1_b, lname("enc.blocks.%d.ffn.fc1.bias", i), enc_ff);
+            GET_LIN(b.ffn_fc2_w, lname("enc.blocks.%d.ffn.fc2.weight", i), enc_ff, d_model);
+            GET_F32(b.ffn_fc2_b, lname("enc.blocks.%d.ffn.fc2.bias", i), d_model);
+        }
     }
 
     // ----- decoder top -----

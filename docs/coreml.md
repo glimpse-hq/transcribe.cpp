@@ -107,7 +107,7 @@ first load compiles for about 12 s, cached loads take 0.1 s. A missing or mismat
 See `docs/models/parakeet.md` for the adapter contract and supported variants.
 
 
-### Decoder-only packages (Parakeet TDT V3, Qwen3-ASR)
+### Decoder-only packages (Parakeet TDT V3, Qwen3-ASR, Whisper)
 
 `scripts/extract-coreml-decoder.py SOURCE.gguf OUTPUT-decoder.gguf` copies the
 original GGUF metadata and every non-encoder tensor, omitting `enc.*`.
@@ -115,9 +115,10 @@ It sets `stt.<arch>.decoder_only=true` and records
 `stt.<arch>.source_sha256`. Use the Core ML encoder exported from SOURCE;
 the extraction step does not change the encoder or decoder weights.
 
-`ParakeetModel::decoder_only` and `QwenAsrModel::decoder_only` skip encoder
-tensor validation and preparation. Parakeet supports this package for offline
-TDT V3 only. Session creation requires the matching
-Core ML companion; builds without Core ML cannot create such a session.
-Inputs exceeding the companion capacity return an error requesting chunking.
+`ParakeetModel::decoder_only`, `QwenAsrModel::decoder_only` and
+`WhisperModel::decoder_only` skip encoder tensor validation and preparation.
+Parakeet supports this package for offline TDT V3 only. Session creation
+requires the matching Core ML companion; builds without Core ML cannot create
+such a session. Parakeet and Qwen3-ASR inputs exceeding the companion capacity
+return an error requesting chunking; Whisper always encodes fixed 30 s windows.
 Full GGUF models retain their existing CPU/GPU path and over-capacity fallback.
