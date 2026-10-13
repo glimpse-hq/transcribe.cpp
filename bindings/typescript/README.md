@@ -111,8 +111,9 @@ model.accepts({ kind: "whisper" }); // does this model take that extension?
 
 ### Diarization (DIARIZE role)
 
-`model.roles` lists what a model serves (`"asr"`, `"diarize"`; Sortformer is
-diarize-only). Calls for a role the model lacks throw `UnsupportedRole`.
+`model.roles` lists what a model serves (`"asr"`, `"diarize"`, `"langid"`,
+`"vad"`; Sortformer is diarize-only). Calls for a role the model lacks throw
+`UnsupportedRole`.
 
 ```ts
 const { sampleRate, maxSpeakers } = model.diarizeInfo;
@@ -127,9 +128,53 @@ for (const t of turns) console.log(t.speakerId, t.t0Ms, t.t1Ms);
 `diarizer.timings` reports the last run. Diarize runs wait on the same
 model-wide lock as other compute calls (see below).
 
+### Language ID (LANGID role)
+
+A `"langid"` model (VoxLingua107 ECAPA-TDNN) ranks its own label codes; match
+`result.code` against an ASR model's `capabilities.languages` yourself.
+Every allowed label is returned, ranked by `p`. Omitting `allowed` scores every
+label, `[]` throws `InvalidArgument`, clips under `model.langidInfo.minAudioMs`
+throw `InputTooShort`, and input longer than `maxAudioMs` is scored on its first `maxAudioMs`.
+
+```ts
+using lid = model.createLangIdSession();
+const result = await lid.run(pcm, { allowed: ["en", "de", "fr"] });
+console.log(result.code, result.candidates[0].p, result.allowedMass);
+```
+
+### Voice activity detection (VAD role)
+
+A `"vad"` model (Silero VAD) scores `model.vadInfo.frameSamples`-sample frames
+(512 = 32 ms at 16 kHz) with a speech probability. `run` scores a whole clip
+and segments it with Silero's `get_speech_timestamps` rules (options such as
+`threshold`, `minSilenceMs` and `maxSpeechMs`; samples are 16 kHz indices):
+
+```ts
+using vad = model.createVadSession();
+const { segments, probs } = await vad.run(pcm, { threshold: 0.5 });
+for (const s of segments) console.log(s.startSample, s.endSample);
+```
+
+For live audio, `streamFeed(chunk)` returns the probabilities of the frames
+each chunk completes (`firstFrame` is the index of `probs[0]`), `streamFlush()`
+scores the zero-padded remainder and ends the stream, and `streamReset()` drops
+it. The next feed after either starts at frame 0, as does the next feed after an
+abort or processing error.
+
+```ts
+for await (const chunk of mic) {
+  const { firstFrame, probs } = await vad.streamFeed(chunk);
+  probs.forEach((p, i) => console.log(firstFrame + i, p));
+}
+const tail = await vad.streamFlush();
+```
+
+A VAD stream is session state, not a stream lease: VAD calls raise `Busy` only
+while an ASR stream on the same model holds the lease.
+
 ### Resource management
 
-`TranscribeModel`, `Session`, `DiarizeSession`, and `Stream` all implement
+`TranscribeModel`, `Session`, `DiarizeSession`, `LangIdSession`, `VadSession`, and `Stream` all implement
 `Symbol.dispose`, so `using` works (TypeScript 5.2+ / Node 22+):
 
 ```ts
@@ -319,4 +364,4 @@ to your `build.rs` as `DEP_TRANSCRIBE_CPP_RUNTIME_DIR`.
 ## License
 
 MIT. Bundled native packages include third-party license texts (ggml, miniz,
-and any bundled backend runtimes).
+Silero VAD, and any bundled backend runtimes).

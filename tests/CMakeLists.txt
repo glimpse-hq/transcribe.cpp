@@ -383,10 +383,10 @@ add_test(NAME transcribe_run_dispatch_unit
 
 # -----------------------------------------------------------------------------
 # Dispatcher units against fake arches: roles, host thread pool, non-finite
-# input, throwing stream hooks, DIARIZE role
+# input, throwing stream hooks, DIARIZE and LANGID roles, VAD segmentation
 # -----------------------------------------------------------------------------
 
-foreach(_t role_resolve run_on_threads nonfinite_input stream_hook_throw diarize_dispatch)
+foreach(_t role_resolve run_on_threads nonfinite_input stream_hook_throw diarize_dispatch langid_dispatch vad_segments)
     add_executable(transcribe_${_t}_unit ${_t}_unit.cpp)
     target_link_libraries(transcribe_${_t}_unit PRIVATE transcribe)
     target_include_directories(transcribe_${_t}_unit PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -554,7 +554,13 @@ set(TRANSCRIBE_FIXTURE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/tokenizer_minimal_streaming_buffered.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_cohere_minimal.gguf
     ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_granite5_ctc_minimal.gguf
-    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_qwen3_asr_minimal.gguf)
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_qwen3_asr_minimal.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_minimal.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_q8_0.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_q8_0_as_f16.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_bad_hop0.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_bad_win_gt_fft.gguf
+    ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_silero_vad.gguf)
 
 find_program(TRANSCRIBE_UV uv)
 
@@ -798,6 +804,34 @@ if(TRANSCRIBE_UV)
         COMMAND transcribe_granite5_ctc_smoke)
     set_tests_properties(transcribe_granite5_ctc_smoke PROPERTIES
         SKIP_RETURN_CODE 77)
+endif()
+
+# -----------------------------------------------------------------------------
+# ecapa_tdnn (LANGID role) fixture smoke
+# -----------------------------------------------------------------------------
+
+if(TRANSCRIBE_UV)
+    add_executable(transcribe_ecapa_tdnn_smoke ecapa_tdnn_smoke.cpp)
+    target_link_libraries(transcribe_ecapa_tdnn_smoke PRIVATE transcribe)
+    target_compile_definitions(transcribe_ecapa_tdnn_smoke PRIVATE
+        "TRANSCRIBE_TEST_FIXTURES_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/fixtures\"")
+    transcribe_apply_warnings(transcribe_ecapa_tdnn_smoke)
+    add_dependencies(transcribe_ecapa_tdnn_smoke fixtures)
+    add_test(NAME transcribe_ecapa_tdnn_smoke COMMAND transcribe_ecapa_tdnn_smoke)
+endif()
+
+# -----------------------------------------------------------------------------
+# silero_vad (VAD role) fixture smoke
+# -----------------------------------------------------------------------------
+
+if(TRANSCRIBE_UV)
+    add_executable(transcribe_silero_vad_smoke silero_vad_smoke.cpp)
+    target_link_libraries(transcribe_silero_vad_smoke PRIVATE transcribe)
+    target_compile_definitions(transcribe_silero_vad_smoke PRIVATE
+        "TRANSCRIBE_TEST_FIXTURES_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/fixtures\"")
+    transcribe_apply_warnings(transcribe_silero_vad_smoke)
+    add_dependencies(transcribe_silero_vad_smoke fixtures)
+    add_test(NAME transcribe_silero_vad_smoke COMMAND transcribe_silero_vad_smoke)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -1431,6 +1465,38 @@ if(TRANSCRIBE_BUILD_REAL_MODEL_TESTS)
         COMMAND transcribe_nemotron3_diar_stream_unit)
     set_tests_properties(transcribe_nemotron3_diar_stream_unit PROPERTIES
         SKIP_RETURN_CODE 77)
+
+    # ecapa_tdnn on the LANGID role: label table, aliases, top-1 on the
+    # committed FLEURS clips, the 30 s crop, and the GPU graph against the
+    # CPU logits when a GPU backend loads. Gated by
+    # TRANSCRIBE_ECAPA_TDNN_GGUF (RC 77 skip).
+    add_executable(transcribe_ecapa_tdnn_real_smoke
+        ecapa_tdnn_real_smoke.cpp)
+    target_link_libraries(transcribe_ecapa_tdnn_real_smoke
+        PRIVATE transcribe transcribe-common-example ggml)
+    target_compile_definitions(transcribe_ecapa_tdnn_real_smoke PRIVATE
+        "TRANSCRIBE_TEST_SAMPLES_DIR=\"${CMAKE_SOURCE_DIR}/samples\"")
+    transcribe_apply_warnings(transcribe_ecapa_tdnn_real_smoke)
+    add_test(NAME transcribe_ecapa_tdnn_real_smoke
+        COMMAND transcribe_ecapa_tdnn_real_smoke)
+    set_tests_properties(transcribe_ecapa_tdnn_real_smoke PROPERTIES
+        SKIP_RETURN_CODE 77)
+
+    # silero_vad on the VAD role: reference segments of jfk.wav, no speech
+    # in noise.wav and 20 ms streaming parity, on the CPU at 1 and 4
+    # threads. Gated by TRANSCRIBE_SILERO_VAD_GGUF / _V5_BIN / _V6_BIN
+    # (RC 77 skip).
+    add_executable(transcribe_silero_vad_real_smoke
+        silero_vad_real_smoke.cpp)
+    target_link_libraries(transcribe_silero_vad_real_smoke
+        PRIVATE transcribe transcribe-common-example)
+    target_compile_definitions(transcribe_silero_vad_real_smoke PRIVATE
+        "TRANSCRIBE_TEST_SAMPLES_DIR=\"${CMAKE_SOURCE_DIR}/samples\"")
+    transcribe_apply_warnings(transcribe_silero_vad_real_smoke)
+    add_test(NAME transcribe_silero_vad_real_smoke
+        COMMAND transcribe_silero_vad_real_smoke)
+    set_tests_properties(transcribe_silero_vad_real_smoke PROPERTIES
+        SKIP_RETURN_CODE 77)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -1701,4 +1767,14 @@ if(TRANSCRIBE_BUILD_EXAMPLES)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_diarize_smoke.cmake)
     set_tests_properties(transcribe_cli_diarize_smoke PROPERTIES
         SKIP_REGULAR_EXPRESSION "SKIP:")
+
+    if(TRANSCRIBE_UV)
+        add_test(NAME transcribe_cli_langid_smoke
+            COMMAND ${CMAKE_COMMAND}
+                -DCLI=$<TARGET_FILE:transcribe-cli>
+                -DMODEL=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/arch_ecapa_tdnn_minimal.gguf
+                -DWAV=${CMAKE_SOURCE_DIR}/samples/fleurs-en.wav
+                -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli-langid-smoke
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_langid_smoke.cmake)
+    endif()
 endif()

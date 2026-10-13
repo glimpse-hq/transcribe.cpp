@@ -14,6 +14,8 @@ add_library(transcribe
     transcribe.cpp
     transcribe-asr.cpp
     transcribe-diarize.cpp
+    transcribe-langid.cpp
+    transcribe-vad.cpp
     transcribe-loader.cpp
     transcribe-arch.cpp
     transcribe-meta.cpp
@@ -71,6 +73,13 @@ add_library(transcribe
     arch/nemotron3_diar/model.cpp
     arch/nemotron3_diar/stream.cpp
     arch/nemotron3_diar/weights.cpp
+    arch/ecapa_tdnn/graph.cpp
+    arch/ecapa_tdnn/model.cpp
+    arch/ecapa_tdnn/weights.cpp
+    arch/silero_vad/decoder.cpp
+    arch/silero_vad/encoder.cpp
+    arch/silero_vad/model.cpp
+    arch/silero_vad/weights.cpp
     arch/voxtral/model.cpp
     arch/voxtral/capabilities.cpp
     arch/voxtral/weights.cpp

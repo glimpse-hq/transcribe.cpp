@@ -152,8 +152,8 @@
  * exactly and refuses to load a native provider that does not match.
  */
 #define TRANSCRIBE_VERSION_MAJOR 0
-#define TRANSCRIBE_VERSION_MINOR 3
-#define TRANSCRIBE_VERSION_PATCH 1
+#define TRANSCRIBE_VERSION_MINOR 4
+#define TRANSCRIBE_VERSION_PATCH 0
 
 #define TRANSCRIBE_VERSION_STRINGIZE_(x) #x
 #define TRANSCRIBE_VERSION_STRINGIZE(x)  TRANSCRIBE_VERSION_STRINGIZE_(x)
@@ -315,6 +315,9 @@ typedef enum {
     TRANSCRIBE_ERR_OUTPUT_REPETITION      = 19,
     /* The model does not serve the role this call needs; see transcribe_model_roles(). */
     TRANSCRIBE_ERR_UNSUPPORTED_ROLE       = 20,
+    /* The audio is shorter than the role's minimum (e.g. language ID's
+     * transcribe_langid_info::min_audio_ms). Nothing was computed. */
+    TRANSCRIBE_ERR_INPUT_TOO_SHORT        = 21,
 } transcribe_status;
 
 /*
@@ -391,7 +394,19 @@ typedef enum {
     TRANSCRIBE_ABI_DIARIZE_INFO           = 16,
     TRANSCRIBE_ABI_DIARIZE_SESSION_PARAMS = 17,
     TRANSCRIBE_ABI_DIARIZE_PARAMS         = 18,
-    TRANSCRIBE_ABI_DIARIZE_STREAM_PARAMS  = 19,
+    /* include/transcribe/langid.h */
+    TRANSCRIBE_ABI_LANGID_INFO            = 19,
+    TRANSCRIBE_ABI_LANGID_SESSION_PARAMS  = 20,
+    TRANSCRIBE_ABI_LANGID_PARAMS          = 21,
+    TRANSCRIBE_ABI_LANGID_RESULT          = 22,
+    TRANSCRIBE_ABI_LANGID_CANDIDATE       = 23,
+    /* include/transcribe/vad.h */
+    TRANSCRIBE_ABI_VAD_INFO               = 24,
+    TRANSCRIBE_ABI_VAD_SESSION_PARAMS     = 25,
+    TRANSCRIBE_ABI_VAD_PARAMS             = 26,
+    TRANSCRIBE_ABI_VAD_RESULT             = 27,
+    TRANSCRIBE_ABI_VAD_SEGMENT            = 28,
+    TRANSCRIBE_ABI_DIARIZE_STREAM_PARAMS  = 29,
 } transcribe_abi_struct;
 
 /* sizeof / alignof of the selected public struct, or 0 for an unknown id.
@@ -1377,6 +1392,8 @@ TRANSCRIBE_API void transcribe_capabilities_init(struct transcribe_capabilities 
 typedef enum {
     TRANSCRIBE_ROLE_ASR     = 1u << 0,
     TRANSCRIBE_ROLE_DIARIZE = 1u << 1,
+    TRANSCRIBE_ROLE_LANGID  = 1u << 2,
+    TRANSCRIBE_ROLE_VAD     = 1u << 3,
 } transcribe_role;
 
 /*
@@ -1548,7 +1565,10 @@ TRANSCRIBE_API const char * transcribe_model_meta_val_str(const struct transcrib
 /* ----------------------------------------------------------------------- */
 
 /*
- * Load a GGUF model from disk.
+ * Load a GGUF model or a supported whisper.cpp Whisper/Silero .bin from disk.
+ * Format is detected from the file header, not the extension. Silero binary
+ * support is limited to published 16 kHz v5.1.2 and v6.2.0 weights; inference
+ * retains upstream Silero behavior. See docs/vad.md for scope and usage.
  *
  * path is UTF-8, like every path crossing this API; on Windows it is
  * converted to a wide path internally, so non-ASCII paths load

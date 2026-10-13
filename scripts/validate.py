@@ -327,6 +327,22 @@ def parse_cli_transcript(output: str) -> str | None:
     return None
 
 
+def parse_cli_language(output: str) -> dict[str, Any] | None:
+    """The LANGID CLI's `language: <code> index=<i> p=<p>` line."""
+    for line in output.splitlines():
+        if line.startswith("language: "):
+            parts = line[len("language: "):].split()
+            fields = dict(p.split("=", 1) for p in parts[1:] if "=" in p)
+            return {"code": parts[0], "label_index": int(fields["index"]), "p": float(fields["p"])}
+    return None
+
+
+def parse_cli_segments(output: str) -> list[dict[str, int]]:
+    """The VAD CLI's `segment: <i> start=<sample> end=<sample> ...` lines."""
+    return [{"start": int(m[1]), "end": int(m[2])}
+            for m in re.finditer(r"^\s*segment: \d+ start=(\d+) end=(\d+)", output, re.M)]
+
+
 def write_cpp_transcript(
     out_dir: Path,
     *,
@@ -405,7 +421,7 @@ def cmd_ref(args: argparse.Namespace) -> int:
         # family's dumper accepts --revision. The dumper itself ignores
         # --revision when --model resolves to a local directory.
         hf_revision = (manifest.get("source_model") or {}).get("hf_revision")
-        if hf_revision and args.family in ("qwen3_asr", "granite_nar", "granite5_ctc"):
+        if hf_revision and args.family in ("qwen3_asr", "granite_nar", "granite5_ctc", "ecapa_tdnn"):
             common_args += ["--revision", str(hf_revision)]
 
         # Forward any manifest-declared dumper args verbatim. Used today
@@ -440,8 +456,13 @@ def cmd_ref(args: argparse.Namespace) -> int:
         #
         # nemotron3_diar follows the same split; VALIDATE_NEMOTRON3_DIAR_PRESET
         # pairs the reference --preset with TRANSCRIBE_NEMOTRON3_DIAR_PRESET.
+        # ecapa_tdnn (language ID) is one forward pass: the `encoder`
+        # subcommand dumps the front end, encoder, classifier and
+        # prediction.json from a single classify_batch call.
         if args.family in DIARIZER_FAMILIES:
             stages = ["encoder", "diarize"]
+        elif args.family in ("ecapa_tdnn", "silero_vad"):
+            stages = ["encoder"]
         else:
             stages = case_stages(case, ["encoder", "decode"])
         sf_preset = os.environ.get(DIARIZER_PRESET_ENV.get(args.family, ""))
@@ -584,9 +605,23 @@ def cmd_cpp(args: argparse.Namespace) -> int:
                 f"error: cpp dump [{args.family}/{case_name}] failed "
                 f"with exit code {result.returncode}"
             )
+        if manifest.get("role") == "vad":
+            # A VAD model: its behavioural artifact is the speech segments,
+            # compared against the reference's segments.json.
+            segments = parse_cli_segments(result.stdout or "")
+            (out_dir / "segments.json").write_text(json.dumps({"segments": segments}, indent=2) + "\n")
+            print(f"  wrote {out_dir / 'segments.json'}", file=sys.stderr)
+            continue
         transcript = parse_cli_transcript(result.stdout or "")
         if transcript is None and "speaker segments:" in (result.stdout or ""):
             continue  # a diarizer has no transcript
+        prediction = parse_cli_language(result.stdout or "") if transcript is None else None
+        if prediction is not None:
+            # A language ID model: its behavioural artifact is the top-1
+            # label, compared against the reference's prediction.json.
+            (out_dir / "prediction.json").write_text(json.dumps(prediction, indent=2) + "\n")
+            print(f"  wrote {out_dir / 'prediction.json'}", file=sys.stderr)
+            continue
         if transcript is None:
             raise SystemExit(
                 f"error: cpp dump [{args.family}/{case_name}] did not emit a transcript line"
@@ -685,6 +720,37 @@ def cmd_compare(args: argparse.Namespace) -> int:
         # emits speaker segments, not `text`). Its behavioral artifact is the
         # diar.probs tensor, gated above; the `diarize` stage's segment lines
         # are informational only, so skip the text-transcript comparison.
+        # Language ID: the gate is the top-1 label index, C++ vs reference.
+        # The case's expected_language is informational (the reference itself
+        # may miss it); it is reported, never gated.
+        ref_prediction = ref_dir / "prediction.json"
+        if ref_prediction.exists():
+            ref_pred = json.loads(ref_prediction.read_text())
+            cpp_prediction = cpp_dir / "prediction.json"
+            cpp_pred = (json.loads(cpp_prediction.read_text()) if cpp_prediction.exists()
+                        else {"code": "<missing prediction.json>"})
+            match = cpp_pred.get("label_index") == ref_pred["label_index"]
+            all_passed = all_passed and match
+            transcript_results.append({"case": case_name, "match": match, "mode": "label",
+                                       "reference": ref_pred["code"], "cpp": cpp_pred["code"]})
+            expected = case.get("expected_language") if isinstance(case, dict) else None
+            print(f"\n  Prediction: {'ok' if match else 'FAIL'} c++ {cpp_pred['code']!r}, "
+                  f"reference {ref_pred['code']!r}, expected {expected!r}")
+
+        # VAD: the gate is exact speech-segment parity (sample positions).
+        # A missing artifact on either side is a failure, not a skip.
+        if manifest.get("role") == "vad":
+            ref_segs, cpp_segs = ((json.loads(f.read_text())["segments"] if f.exists() else None)
+                                  for f in (ref_dir / "segments.json", cpp_dir / "segments.json"))
+            match = ref_segs is not None and cpp_segs == ref_segs
+            all_passed = all_passed and match
+            transcript_results.append({"case": case_name, "match": match, "mode": "segments",
+                                       "reference": ref_segs, "cpp": cpp_segs})
+            if match:
+                print(f"\n  Segments: ok ({len(ref_segs)} identical)")
+            else:
+                print(f"\n  Segments: FAIL\n    reference: {ref_segs}\n    c++:       {cpp_segs}")
+
         ref_transcript = ref_dir / "transcript.json"
         if ref_transcript.exists() and args.family not in DIARIZER_FAMILIES:
             transcript_compare = case_transcript_compare(manifest, case)
