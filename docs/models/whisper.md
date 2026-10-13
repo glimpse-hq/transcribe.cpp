@@ -173,12 +173,35 @@ encoder that cannot load or predict returns an error instead of silently using
 ggml. Builds without Core ML support reject a nonempty path. Encoders without
 matching variant metadata are rejected. The SHA-256 is provenance metadata, not
 a runtime file-hash check. The session retains the Core ML model for reuse.
-The model file's encoder weights remain loaded too.
+The model file's encoder weights remain loaded too, unless it is a
+decoder-only package.
 
 The CLI's `backend` field describes the ggml decoder backend. The
 `Core ML encoder loaded` log identifies the separate encoder path. Tensor
 debugging provides `enc.final`; internal Core ML layers are not exposed.
 Flash-attention flags apply only to the ggml portions of the run.
+
+### Decoder-only Whisper packages
+
+`scripts/extract-coreml-decoder.py SOURCE.gguf OUTPUT-decoder.gguf` copies the
+original GGUF metadata and the decoder and frontend tensors, omitting encoder
+tensors. It sets `stt.whisper.decoder_only=true` and records
+`stt.whisper.source_sha256`. Pair it with an encoder exported for the same
+variant; the extraction step does not change the encoder or decoder weights.
+The source must be a GGUF, not a whisper.cpp `.bin`.
+
+```bash
+uv run --python 3.11 scripts/extract-coreml-decoder.py \
+  models/whisper-tiny-Q8_0.gguf models/whisper-tiny-Q8_0-decoder.gguf
+
+TRANSCRIBE_WHISPER_COREML_MODEL=models/whisper-tiny-encoder.mlmodelc \
+  build/bin/transcribe-cli -m models/whisper-tiny-Q8_0-decoder.gguf samples/jfk.wav
+```
+
+`WhisperModel::decoder_only` skips encoder tensor validation and loading.
+Session creation requires the matching Core ML companion; builds without Core
+ML cannot create such a session. Full model files retain their existing CPU/GPU
+path.
 
 Run the optional regression check after building the CLI:
 

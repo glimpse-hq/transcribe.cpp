@@ -422,6 +422,14 @@ transcribe_status whisper_load(Loader &                             loader,
         return st;
     }
 
+    const int64_t decoder_only_key = gguf_find_key(loader.gguf(), "stt.whisper.decoder_only");
+    if (decoder_only_key >= 0) {
+        if (gguf_get_kv_type(loader.gguf(), decoder_only_key) != GGUF_TYPE_BOOL) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        m->decoder_only = gguf_get_val_bool(loader.gguf(), decoder_only_key);
+    }
+
     // Tokenizer. Whisper GGUFs carry a "gpt2"-family (HF byte-level BPE)
     // tokenizer. DO NOT overwrite vocab_size from the tokenizer: the decoder
     // vocab (51865 multilingual) exceeds tokenizer.tokens (50258) because
@@ -487,7 +495,8 @@ transcribe_status whisper_load(Loader &                             loader,
         return TRANSCRIBE_ERR_GGUF;
     }
 
-    if (const transcribe_status st = build_whisper_weights(m->ctx_meta, m->hparams, m->weights); st != TRANSCRIBE_OK) {
+    if (const transcribe_status st = build_whisper_weights(m->ctx_meta, m->hparams, m->weights, !m->decoder_only);
+        st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
     }
@@ -608,6 +617,11 @@ transcribe_status whisper_init_context(transcribe_model *                model,
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper: rebuild with TRANSCRIBE_COREML=ON to use a Core ML encoder");
         return TRANSCRIBE_ERR_INVALID_ARG;
 #endif
+    }
+
+    if (static_cast<WhisperModel *>(model)->decoder_only && cc->coreml_encoder == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper: decoder-only GGUF requires a matching Core ML encoder");
+        return TRANSCRIBE_ERR_INVALID_ARG;
     }
 
     *out_ctx = cc.release();
