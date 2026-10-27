@@ -75,6 +75,8 @@ struct ParakeetHParams {
     //     left/chunk_size. nemotron-speech-streaming-en-0.6b ([70, 13]).
     int32_t enc_att_context_left     = -1;
     int32_t enc_att_context_right    = -1;
+    // Set when a full-attention checkpoint was switched to the long-form window.
+    bool    enc_att_longform         = false;
 
     // Multi-lookahead training menu for cache-aware streaming models. A
     // flat GGUF int32 array [L0,R0,L1,R1,...]; index 0 is the default

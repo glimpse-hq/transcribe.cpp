@@ -660,9 +660,11 @@ transcribe_status init_context(transcribe_model *                model,
     if (const char * path = transcribe::session_coreml_encoder_path(params, "TRANSCRIBE_PARAKEET_COREML_MODEL")) {
 #ifdef TRANSCRIBE_COREML
         const auto & hp = static_cast<ParakeetModel *>(model)->hparams;
+        // The long-form window only applies to the ggml encoder; Core ML runs the full-attention encoder.
+        const bool local_att = !hp.enc_att_longform && (hp.enc_att_context_left >= 0 || hp.enc_att_context_right >= 0);
         if (hp.enc_subsampling_factor != 8 || hp.enc_conv_norm_type != ParakeetHParams::ConvNormType::BatchNorm ||
-            hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited ||
-            hp.enc_att_context_left >= 0 || hp.enc_att_context_right >= 0 || hp.has_spk_kernel) {
+            hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited || local_att ||
+            hp.has_spk_kernel) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                     "parakeet Core ML: only full-context, batch-norm, 8x-subsampling encoders are supported");
             return TRANSCRIBE_ERR_UNSUPPORTED_VARIANT;

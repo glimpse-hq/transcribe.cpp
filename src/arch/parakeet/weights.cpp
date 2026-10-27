@@ -544,6 +544,7 @@ transcribe_status read_parakeet_hparams(const gguf_context * gguf, ParakeetHPara
         hp.enc_att_context_right < 0 && !hp.kestrel_length_masking) {
         hp.enc_att_context_left  = kLongformAttContext;
         hp.enc_att_context_right = kLongformAttContext;
+        hp.enc_att_longform      = true;
         hp.enc_att_context_size_choices.assign(1, std::make_pair(kLongformAttContext, kLongformAttContext));
         log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "parakeet: full-attention checkpoint; using local attention [%d, %d]",
                 kLongformAttContext, kLongformAttContext);
