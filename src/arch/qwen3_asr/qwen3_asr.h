@@ -10,6 +10,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
+#include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
@@ -82,7 +83,7 @@ struct QwenAsrModel final : public transcribe_model {
     bool           decoder_only = false;  // stt.qwen3_asr.decoder_only: no enc.* tensors
 
     transcribe::BackendPlan                    plan;
-    ggml_backend_buffer_t                      backend_buffer = nullptr;
+    transcribe::load_common::WeightStorage     weight_storage;
     transcribe::causal_lm::PackedGateUpHandles packed_gate_up;
 
     std::optional<transcribe::MelFrontend> mel;
