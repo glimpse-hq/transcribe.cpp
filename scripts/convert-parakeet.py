@@ -421,6 +421,25 @@ VARIANT_PROFILES: dict[str, dict] = {
         "license_name": "openmdw-1.1",
         "license_link": "https://openmdw.ai/license/1-1/",
     },
+    # Multilingual parakeet-unified-en-0.6b: the same unified offline +
+    # buffered-streaming encoder, plus Nemotron 3.5's language prompt
+    # MLP. Its prompt dictionary keeps the 128-slot Nemotron 3.5 table;
+    # only the 25 card languages are advertised.
+    "nemotron-labs-unified-asr-0.6b": {
+        "variant": "nemotron-labs-unified-asr-0.6b",
+        "display_name": "Nemotron Unified ASR",
+        "version": "v1",
+        "size_label": "0.6B",
+        "basename": "parakeet-rnnt",
+        "head_kind": "rnnt",
+        "expected_vocab_size": 4095,
+        "languages": ["bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk"],
+        "lang_detect": True,
+        "has_prompt": True,
+        "license": "other",
+        "license_name": "openmdw-1.1",
+        "license_link": "https://openmdw.ai/license/1-1/",
+    },
     # Cache-aware streaming RNN-T with always-on speaker-kernel FF
     # injection. Full speaker-attributed decoding requires an external
     # Sortformer diarizer and is outside this variant's runtime scope.

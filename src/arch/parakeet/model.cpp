@@ -208,6 +208,80 @@ bool fill_prompt_one_hot(std::vector<float> &         out,
     return true;
 }
 
+// Uploads one utterance's prompt one-hot for `language` (null = auto).
+static transcribe_status set_prompt_one_hot(ggml_tensor * one_hot, const ParakeetHParams & hp, const char * language) {
+    const int32_t pid = resolve_prompt_id(hp, language);
+    if (pid < 0) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: language \"%s\" not in prompt dictionary",
+                language != nullptr ? language : "<null>");
+        return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+    }
+    std::vector<float> buf;
+    if (!fill_prompt_one_hot(buf, static_cast<int>(one_hot->ne[0]), static_cast<int>(one_hot->ne[1]), 1, { pid })) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: prompt_id %d out of range", pid);
+        return TRANSCRIBE_ERR_GGUF;
+    }
+    ggml_backend_tensor_set(one_hot, buf.data(), 0, buf.size() * sizeof(float));
+    return TRANSCRIBE_OK;
+}
+
+#ifdef TRANSCRIBE_COREML
+// Core ML runs only the encoder, so the prompt MLP (see build_encoder_graph)
+// runs here on its [T, d_model] output, in place.
+static transcribe_status apply_prompt_mlp(ParakeetSession *    pc,
+                                          ParakeetModel *      pm,
+                                          const char *         language,
+                                          std::vector<float> & enc) {
+    const auto & hp = pm->hparams;
+    if (!hp.has_prompt) {
+        return TRANSCRIBE_OK;
+    }
+    const int        d   = hp.enc_d_model;
+    const int        T   = static_cast<int>(enc.size() / static_cast<size_t>(d));
+    ggml_init_params ip  = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context *   ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return TRANSCRIBE_ERR_OOM;
+    }
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx_guard(ctx, ggml_free);
+
+    const auto &  w       = pm->weights.prompt;
+    ggml_tensor * x       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, T);
+    ggml_tensor * one_hot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.prompt_num_prompts, T);
+    ggml_set_input(x);
+    ggml_set_input(one_hot);
+    ggml_tensor * h = ggml_mul_mat(ctx, w.mlp0_w, ggml_concat(ctx, x, one_hot, 0));
+    h               = ggml_relu(ctx, ggml_add(ctx, h, w.mlp0_b));
+    ggml_tensor * y = ggml_add(ctx, ggml_mul_mat(ctx, w.mlp2_w, h), w.mlp2_b);
+    ggml_set_output(y);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+
+    if (pc->sched == nullptr) {
+        pc->sched = ggml_backend_sched_new(pm->plan.scheduler_list.data(), nullptr,
+                                           static_cast<int>(pm->plan.scheduler_list.size()),
+                                           /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
+        if (pc->sched == nullptr) {
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+    }
+    ggml_backend_sched_reset(pc->sched);
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(pc->sched, gf, "parakeet")) {
+        return TRANSCRIBE_ERR_OOM;
+    }
+    ggml_backend_tensor_set(x, enc.data(), 0, enc.size() * sizeof(float));
+    if (const transcribe_status st = set_prompt_one_hot(one_hot, hp, language); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    transcribe::configure_sched_n_threads(pc->sched, pc->n_threads);
+    if (ggml_backend_sched_graph_compute(pc->sched, gf) != GGML_STATUS_SUCCESS) {
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    ggml_backend_tensor_get(y, enc.data(), 0, enc.size() * sizeof(float));
+    return TRANSCRIBE_OK;
+}
+#endif
+
 // Fuse inference-time BatchNorm into scale + bias tensors:
 //   BN eval: y = (x - mean) / sqrt(var + eps) * weight + bias
 //   fused:   y = x * scale + shift,  scale = weight / sqrt(var + eps),
@@ -1238,6 +1312,11 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
             const long long shape[2] = { frames, d_model };
             transcribe::debug::dump_host_f32("enc.final", pc->enc_host.data(),
                                              static_cast<long long>(pc->enc_host.size()), shape, 2, "encoder.final");
+            if (const transcribe_status st =
+                    apply_prompt_mlp(pc, pm, params != nullptr ? params->language : nullptr, pc->enc_host);
+                st != TRANSCRIBE_OK) {
+                return st;
+            }
             return decode_and_populate(pc, pm, params, pc->enc_host.data(), frames, d_model, -1);
         }
         if (pm->decoder_only) {
@@ -2317,7 +2396,10 @@ static transcribe_status run_batch_coreml(ParakeetSession *             pc,
             pc->t_mel_us    = e.mel_us;
             pc->t_encode_us = e.enc_us;
             pc->encoder_out = nullptr;
-            st = decode_and_populate(pc, pm, params, e.enc.data(), static_cast<int>(e.enc.size() / d), d, -1);
+            st              = apply_prompt_mlp(pc, pm, params != nullptr ? params->language : nullptr, e.enc);
+            if (st == TRANSCRIBE_OK) {
+                st = decode_and_populate(pc, pm, params, e.enc.data(), static_cast<int>(e.enc.size() / d), d, -1);
+            }
         } else if (st == TRANSCRIBE_OK) {
             st = run_one_shot_inner(pc, pm, pcm[i], n_samples[i], params);
         }
@@ -3357,6 +3439,13 @@ transcribe_status emit_buffered_chunk(ParakeetSession * pc,
         compute_chunked_limited_with_rc_mask(mask_buf.data(), T_enc, pc->buf_left_frames, pc->buf_chunk_frames,
                                              pc->buf_right_frames, effective_T);
         ggml_backend_tensor_set(eb.chunked_mask_in, mask_buf.data(), 0, mask_buf.size() * sizeof(float));
+    }
+
+    if (eb.prompt_one_hot_in != nullptr) {
+        if (const transcribe_status st = set_prompt_one_hot(eb.prompt_one_hot_in, hp, pc->stream_run_params.language);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
     }
 
     // ----- Threading -----

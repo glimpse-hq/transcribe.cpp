@@ -79,7 +79,7 @@ def run_subprocess(cmd: list[str], *, label: str, env: dict | None = None,
 
 def run_ref_dump(*, nemo: Path, audio: Path, out_dir: Path,
                  left_secs: float, chunk_secs: float, right_secs: float,
-                 force: bool) -> Path:
+                 language: str, force: bool) -> Path:
     stamp = out_dir / "stream_history.json"
     if stamp.exists() and not force:
         print(f"  [skip ref] {stamp} exists (pass --force to re-run)")
@@ -96,6 +96,7 @@ def run_ref_dump(*, nemo: Path, audio: Path, out_dir: Path,
         "--chunk-secs", f"{chunk_secs}",
         "--right-secs", f"{right_secs}",
     ]
+    cmd += ["--language", language]
     run_subprocess(cmd, label="ref dump", cwd=REPO)
     return out_dir
 
@@ -105,7 +106,8 @@ def run_cpp_dump(*, gguf: Path, audio: Path, out_dir: Path,
                  threads: int | None,
                  left_ms: int | None,
                  chunk_ms: int | None,
-                 right_ms: int | None) -> tuple[Path, str]:
+                 right_ms: int | None,
+                 language: str) -> tuple[Path, str]:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -132,6 +134,7 @@ def run_cpp_dump(*, gguf: Path, audio: Path, out_dir: Path,
         cmd += ["--stream-buf-chunk-ms", str(chunk_ms)]
     if right_ms is not None:
         cmd += ["--stream-buf-right-ms", str(right_ms)]
+    cmd += ["--language", language]
     env = {"TRANSCRIBE_DUMP_DIR": str(out_dir)}
     proc = run_subprocess(cmd, label="cpp dump", env=env,
                           cwd=REPO, capture=True)
@@ -227,6 +230,8 @@ def main() -> int:
     p.add_argument("--backend", default="cpu")
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--feed-ms", type=int, default=500)
+    p.add_argument("--language", default="en",
+                   help="target language; prompt-conditioned models take any of theirs (e.g. de)")
     p.add_argument("--force", action="store_true")
     args = p.parse_args()
 
@@ -240,6 +245,7 @@ def main() -> int:
         left_secs=args.left_secs,
         chunk_secs=args.chunk_secs,
         right_secs=args.right_secs,
+        language=args.language,
         force=args.force,
     )
     cpp_path, cpp_text = run_cpp_dump(
@@ -250,6 +256,7 @@ def main() -> int:
         left_ms=int(round(args.left_secs   * 1000)),
         chunk_ms=int(round(args.chunk_secs * 1000)),
         right_ms=int(round(args.right_secs * 1000)),
+        language=args.language,
     )
 
     # Final transcript byte equality

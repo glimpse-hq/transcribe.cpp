@@ -1285,6 +1285,12 @@ def cmd_buffered_streaming(args: argparse.Namespace) -> int:
     cumulative_tokens: list[int] = []
     step_num = 0
 
+    prompt_kwargs = {}
+    if is_prompt_aware(model):
+        prompt_id = resolve_prompt_id(model, args.language)
+        print(f"prompt: target_lang={args.language!r} prompt_id={prompt_id}")
+        prompt_kwargs["prompt_indices"] = torch.tensor([prompt_id], dtype=torch.long)
+
     with torch.inference_mode():
         while left_sample < audio_tensor.shape[1]:
             chunk_length = min(right_sample, audio_tensor.shape[1]) - left_sample
@@ -1312,6 +1318,7 @@ def cmd_buffered_streaming(args: argparse.Namespace) -> int:
             encoder_output, encoder_output_len = model(
                 input_signal=buffer.samples,
                 input_signal_length=buffer.context_size_batch.total(),
+                **prompt_kwargs,
             )
             encoder_output = encoder_output.transpose(1, 2)  # (B, T_enc, D)
             encoder_context = buffer.context_size.subsample(
