@@ -40,8 +40,8 @@ Most users want one of three:
   [`nemotron-3.5-asr-streaming-0.6b`](nemotron-3.5-asr-streaming-0.6b.md)
   (multilingual) or
   [`nemotron-speech-streaming-en-0.6b`](nemotron-speech-streaming-en-0.6b.md)
-  (English). Within Parakeet itself, `parakeet-unified-en-0.6b` is the only
-  streaming-capable variant.
+  (English). Within Parakeet itself, `parakeet-unified-en-0.6b` and its
+  25-language successor `nemotron-labs-unified-asr-0.6b` stream.
 
 If you specifically need the lowest WER or a different decoder:
 
@@ -166,8 +166,9 @@ All Parakeet variants support:
 - **Token-level timestamps** at the encoder frame rate (TDT and RNN-T;
   CTC also exposes frame-level alignment).
 
-**Buffered streaming** is supported on `parakeet-unified-en-0.6b`
-across all six published `(L, C, R)` configurations from the model's
+**Buffered streaming** is supported on `parakeet-unified-en-0.6b` and
+`nemotron-labs-unified-asr-0.6b` (which also takes a language, `-l de`, or
+detects it) across all six published `(L, C, R)` configurations from the model's
 training menu (lookahead latency from 160ms at `(70, 1, 1)` through
 2.08s at the default `(70, 13, 13)`). See
 [parakeet-unified-en-0.6b.md](parakeet-unified-en-0.6b.md#streaming)

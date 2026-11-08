@@ -93,7 +93,9 @@ The offline Parakeet adapter loads the same session companion through
 GGUF using `scripts/convert-parakeet-gguf-to-coreml.py`. The default capacity is
 1501 mel frames (about 15 seconds); shorter inputs are length-masked and longer
 inputs use the existing ggml encoder. Streaming-only variants are rejected;
-Unified's offline path is supported and its streaming path keeps ggml.
+Unified's offline path is supported and its streaming path keeps ggml. For
+models with a language prompt the prompt MLP runs on the encoder output after
+Core ML.
 
 The encoder uses CPU + Neural Engine, with GPU excluded. Its output feeds the
 existing host decoder. The layers are split into chained programs (four for
