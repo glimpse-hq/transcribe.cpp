@@ -1294,6 +1294,17 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
         return mst;
     }
     pc->t_mel_us = ggml_time_us() - t_mel_start;
+    // Dump the full frontend output (what NeMo's preprocessor returns)
+    // before the padding frame is dropped.
+    if (transcribe::debug::enabled()) {
+        const long long shape[2] = { mel_n_mels, mel_n_frames };
+        transcribe::debug::dump_host_f32("enc.mel.in", pc->mel_buf.data(), static_cast<long long>(pc->mel_buf.size()),
+                                         shape, 2, "encoder.mel");
+    }
+    // Kestrel-masked checkpoints mask the padding frame in-graph instead.
+    if (!pm->hparams.kestrel_length_masking) {
+        mel_n_frames = pm->mel->drop_nemo_padding_frame(pc->mel_buf, mel_n_frames, static_cast<size_t>(n_samples));
+    }
 
 #ifdef TRANSCRIBE_COREML
     if (pc->coreml_encoder != nullptr) {
@@ -1438,8 +1449,6 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
     // Upload the mel; the row-major [num_mels, n_frames] buffer is
     // byte-identical to the ggml ne=[n_frames, num_mels, 1, 1] input.
     ggml_backend_tensor_set(eb.mel_in, pc->mel_buf.data(), 0, pc->mel_buf.size() * sizeof(float));
-
-    transcribe::debug::dump_tensor("enc.mel.in", eb.mel_in, "encoder.mel");
 
     int T_valid = -1;
     if (kestrel_masks) {
@@ -2360,6 +2369,9 @@ static transcribe_status run_batch_coreml(ParakeetSession *             pc,
                 } else {
                     const int64_t t0 = ggml_time_us();
                     e.st             = pm->mel->compute(pcm[i], static_cast<size_t>(n_samples[i]), mel, n_mels, frames);
+                    if (e.st == TRANSCRIBE_OK && !pm->hparams.kestrel_length_masking) {
+                        frames = pm->mel->drop_nemo_padding_frame(mel, frames, static_cast<size_t>(n_samples[i]));
+                    }
                     const int64_t t1 = ggml_time_us();
                     e.mel_us         = t1 - t0;
                     if (e.st == TRANSCRIBE_OK && frames <= coreml_encoder_capacity(pc->coreml_encoder)) {
@@ -2497,7 +2509,9 @@ transcribe_status run_batch(transcribe_session *          session,
             if (st != TRANSCRIBE_OK || this_frames <= 0) {
                 return false;
             }
-            nf[i]         = this_frames;
+            nf[i] = pm->hparams.kestrel_length_masking ?
+                        this_frames :
+                        pm->mel->drop_nemo_padding_frame(mels[i], this_frames, static_cast<size_t>(n_samples[i]));
             n_mels_per[i] = this_mels;
             return true;
         });
