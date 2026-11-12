@@ -535,14 +535,19 @@ transcribe_status MelFrontend::compute(const float *        pcm,
     if (stft_threads <= 0) {
         stft_threads = default_n_threads();
     }
-    if (stft_threads > n_frames) {
+    if (n_fft_is_pow2) {
+        // Thread start-up outweighs the power-of-two FFT work below about 2000
+        // frames per thread (20 s at a 10 ms hop): on Windows with idle cores 8
+        // threads took 9 ms for 1 s of audio and one thread 4 ms.
+        stft_threads = std::clamp(n_frames / 2000, 1, stft_threads);
+    } else if (stft_threads > n_frames) {
         stft_threads = std::max(1, n_frames);
     }
 
-    // Per-thread worker dispatcher. Strided frame assignment (stride =
-    // stft_threads) keeps load balanced and per-thread memory access
-    // patterns mostly sequential. run_on_threads joins every thread and
-    // hands worker exceptions back to the caller.
+    // Per-thread worker dispatcher. Each thread takes a contiguous block of
+    // frames: strided frames made threads write neighbouring floats of the
+    // same log_mel rows. run_on_threads joins every thread and hands worker
+    // exceptions back to the caller.
     auto run_threaded = [&](auto && worker) {
         run_on_threads(stft_threads, worker);
     };
@@ -556,7 +561,7 @@ transcribe_status MelFrontend::compute(const float *        pcm,
             std::vector<float> fft_in(2 * static_cast<size_t>(n_fft), 0.0f);
             std::vector<float> fft_out(8 * static_cast<size_t>(n_fft), 0.0f);
             std::vector<float> power_scratch(static_cast<size_t>(n_freq));
-            for (int t = tid; t < n_frames; t += stft_threads) {
+            for (int t = n_frames * tid / stft_threads, end = n_frames * (tid + 1) / stft_threads; t < end; ++t) {
                 const size_t start = static_cast<size_t>(t) * static_cast<size_t>(hop);
                 for (int n = 0; n < n_fft; ++n) {
                     fft_in[n] = padded_f32[start + n] * window_f32[n];
@@ -638,7 +643,7 @@ transcribe_status MelFrontend::compute(const float *        pcm,
             std::vector<double>   fft_imag(half_n);
             DSPDoubleSplitComplex split = { fft_real.data(), fft_imag.data() };
 
-            for (int t = tid; t < n_frames; t += stft_threads) {
+            for (int t = n_frames * tid / stft_threads, end = n_frames * (tid + 1) / stft_threads; t < end; ++t) {
                 const size_t start = static_cast<size_t>(t) * static_cast<size_t>(hop);
                 for (size_t k = 0; k < half_n; ++k) {
                     fft_real[k] = padded[start + 2 * k] * window_[2 * k];
@@ -661,7 +666,7 @@ transcribe_status MelFrontend::compute(const float *        pcm,
         // Hand-rolled radix-2 Cooley-Tukey FFT fallback for non-Apple.
         auto worker = [&](int tid) {
             std::vector<double> frame(2 * static_cast<size_t>(n_fft));
-            for (int t = tid; t < n_frames; t += stft_threads) {
+            for (int t = n_frames * tid / stft_threads, end = n_frames * (tid + 1) / stft_threads; t < end; ++t) {
                 const size_t start = static_cast<size_t>(t) * static_cast<size_t>(hop);
                 for (int k = 0; k < n_fft; ++k) {
                     frame[2 * static_cast<size_t>(k)]     = padded[start + static_cast<size_t>(k)] * window_[k];
@@ -725,7 +730,7 @@ transcribe_status MelFrontend::compute(const float *        pcm,
         // Scalar fused matmul + log fallback (no BLAS available), threaded
         // over frames.
         auto mel_worker = [&](int tid) {
-            for (int t = tid; t < n_frames; t += stft_threads) {
+            for (int t = n_frames * tid / stft_threads, end = n_frames * (tid + 1) / stft_threads; t < end; ++t) {
                 const float * pwr = power.data() + static_cast<size_t>(t) * n_freq;
                 for (int m = 0; m < n_mels; ++m) {
                     const float * fb_row = mel_fb_.data() + static_cast<size_t>(m) * n_freq;

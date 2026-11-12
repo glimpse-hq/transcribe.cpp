@@ -583,6 +583,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     GGML_ASSERT(parameter_count > 0);
     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
+    if (spv_size == 0) {
+        GGML_ABORT("ggml_vulkan: shader %s is not in this build (GGML_VULKAN_SHADER_TYPES)", pipeline->name.c_str());
+    }
 
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
 
@@ -1729,6 +1732,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                             l_mmqid_wg_denoms, m_mmqid_wg_denoms, s_mmqid_wg_denoms;
 
     uint32_t l_align, m_align, s_align;
+    uint32_t m_mmq_int_q8_0_bk_step = 4;
 
     // RDNA3.5 preferred wave32 here
     const bool cm1_use_wave32 = device->vendor_id == VK_VENDOR_ID_AMD &&
@@ -1861,6 +1865,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         } else if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && device->coopmat_support) {
             m_warptile     = { 64, 64, 64, 16, 64, 64, 1, tm_l, tn_l, tk_l, 64 };
             m_warptile_mmq = { 64, 64, 64, 32, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
+        } else if (device->vendor_id == VK_VENDOR_ID_INTEL && !device->coopmat_support) {
+            // mul_mmq spills registers on Xe-LP: fewer outputs per thread and BK_STEP 1 (index 11) avoid it.
+            s_warptile_mmq_int = { 128, 32, 32, 32, 16, 16, 1, 2, 1, 1, 32, 1 };
+            m_mmq_int_q8_0_bk_step = 1;
         }
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
@@ -2645,7 +2653,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 sg_create_mmq({GGML_TYPE_Q4_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_q4_1_q8_1", matmul_q4_1_q8_1_len, matmul_q4_1_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_Q5_0, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_q5_0_q8_1", matmul_q5_0_q8_1_len, matmul_q5_0_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_Q5_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_q5_1_q8_1", matmul_q5_1_q8_1_len, matmul_q5_1_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
-                sg_create_mmq({GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_q8_0_q8_1", matmul_q8_0_q8_1_len, matmul_q8_0_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+                std::vector<vk_tile_config> tc_mmq_int_q8_0 = tc_mmq_int;
+                tc_mmq_int_q8_0[1].warptile.push_back(m_mmq_int_q8_0_bk_step);
+                sg_create_mmq({GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_q8_0, "matmul_q8_0_q8_1", matmul_q8_0_q8_1_len, matmul_q8_0_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_MXFP4, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_mxfp4_q8_1", matmul_mxfp4_q8_1_len, matmul_mxfp4_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_1, false, false}, tc_mmq_int, "matmul_iq4_xs_q8_1", matmul_iq4_xs_q8_1_len, matmul_iq4_xs_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_Q2_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q2_k_q8_1", matmul_q2_k_q8_1_len, matmul_q2_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
@@ -15321,6 +15331,19 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+static bool ggml_vk_type_built(ggml_type type) {
+    static const std::array<bool, GGML_TYPE_COUNT> built = [] {
+        std::array<bool, GGML_TYPE_COUNT> b;
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            std::string name = std::string(",") + ggml_type_name((ggml_type) t) + ",";
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+            b[t] = strstr(GGML_VK_PRUNED_TYPES, name.c_str()) == nullptr;
+        }
+        return b;
+    }();
+    return built[type];
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -15342,12 +15365,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         return true;
     };
     // reject any tensors larger than the max buffer size
+    // Views and no-ops need no shader, so a weight of a type without shaders can still be read by the CPU backend.
+    const bool needs_shader = !ggml_op_is_empty(op->op);
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (op->src[i] && !tensor_size_supported(ggml_nbytes(op->src[i]))) {
+        if (op->src[i] && (!tensor_size_supported(ggml_nbytes(op->src[i])) || (needs_shader && !ggml_vk_type_built(op->src[i]->type)))) {
             return false;
         }
     }
-    if (!tensor_size_supported(ggml_nbytes(op))) {
+    if (!tensor_size_supported(ggml_nbytes(op)) || (needs_shader && !ggml_vk_type_built(op->type))) {
         return false;
     }
 

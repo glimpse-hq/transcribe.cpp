@@ -4,6 +4,7 @@
 
 #include "transcribe-model.h"
 
+#include "ggml-backend.h"
 #include "transcribe-backend.h"
 #include "transcribe-session.h"
 
@@ -17,8 +18,26 @@ transcribe::SessionCore::~SessionCore() {
     transcribe::release_compute_scratch(sched, compute_ctx);
 }
 
+constexpr size_t k_kept_scratch_bytes = 64u << 20;
+
+static size_t sched_buffer_bytes(ggml_backend_sched_t sched) {
+    size_t total = 0;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        total += ggml_backend_sched_get_buffer_size(sched, ggml_backend_sched_get_backend(sched, i));
+    }
+    return total;
+}
+
 void transcribe::SessionCore::release_scratch() noexcept {
-    transcribe::release_compute_scratch(sched, compute_ctx);
+    if (sched != nullptr && sched_buffer_bytes(sched) <= k_kept_scratch_bytes) {
+        ggml_backend_sched_reset(sched);
+        if (compute_ctx != nullptr) {
+            ggml_free(compute_ctx);
+            compute_ctx = nullptr;
+        }
+    } else {
+        transcribe::release_compute_scratch(sched, compute_ctx);
+    }
     on_scratch_released();
 }
 

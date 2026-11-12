@@ -274,6 +274,7 @@ option(GGML_HEXAGON                         "ggml: enable Hexagon backend"      
 
 # toolchain for vulkan-shaders-gen
 set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
+set   (GGML_VULKAN_SHADER_TYPES "" CACHE STRING "ggml: Vulkan shader types to build (empty: all)")
 
 option(GGML_ZENDNN                          "ggml: use ZenDNN"                                OFF)
 option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")

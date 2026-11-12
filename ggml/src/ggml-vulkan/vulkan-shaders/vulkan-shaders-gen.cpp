@@ -45,6 +45,7 @@ std::string input_filepath = "";
 std::string output_dir = "/tmp";
 std::string target_hpp = "";
 std::string target_cpp = "";
+std::vector<std::string> pruned_types;
 
 const std::vector<std::string> type_names = {
     "f32",
@@ -444,6 +445,15 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
     } else if (basename(input_filepath) != source) {
         // Only compile shader variants matching the input filename
         return;
+    }
+
+    const std::string tokens = "_" + name + "_";
+    for (const auto& t : pruned_types) {
+        if (tokens.find("_" + t + "_") != std::string::npos) {
+            std::lock_guard<std::mutex> guard(lock);
+            shader_fnames.push_back(std::pair(name, ""));
+            return;
+        }
     }
 
     compile_count_guard slot = acquire_compile_slot();
@@ -1244,6 +1254,11 @@ void write_output_files() {
     std::stringstream src = make_generic_stringstream();
 
     hdr << "#include <cstdint>\n\n";
+    hdr << "#define GGML_VK_PRUNED_TYPES \",";
+    for (const auto& t : pruned_types) {
+        hdr << t << ",";
+    }
+    hdr << "\"\n\n";
     src << "#include \"" << basename(target_hpp) << "\"\n\n";
 
     std::sort(shader_fnames.begin(), shader_fnames.end());
@@ -1259,7 +1274,10 @@ void write_output_files() {
         hdr << "extern const uint64_t " << name << "_len;\n";
         hdr << "extern const unsigned char " << name << "_data[];\n\n";
 
-        if (input_filepath != "") {
+        if (input_filepath != "" && path.empty()) {
+            src << "const uint64_t " << name << "_len = 0;\n";
+            src << "const unsigned char " << name << "_data[1] = {};\n\n";
+        } else if (input_filepath != "") {
             std::string data = read_binary_file(path);
             if (data.empty()) {
                 continue;
@@ -1417,6 +1435,15 @@ int main(int argc, char** argv) {
     if (args.find("--target-cpp") != args.end()) {
         target_cpp = args["--target-cpp"]; // Path to generated cpp file
     }
+    if (args.find("--types") != args.end()) {
+        // Comma-separated types to build; f32 and f16 are always built.
+        const std::string types = "," + args["--types"] + ",";
+        for (const auto& t : type_names) {
+            if (t != "f32" && t != "f16" && types.find("," + t + ",") == std::string::npos) {
+                pruned_types.push_back(t);
+            }
+        }
+    }
 
     if (!directory_exists(output_dir)) {
         if (!create_directory(output_dir)) {
@@ -1426,6 +1453,17 @@ int main(int argc, char** argv) {
     }
 
     process_shaders();
+
+    // Every variant of this source was pruned, so no compile wrote the depfile CMake expects.
+    if (target_cpp != "" && generate_dep_file) {
+        auto escape = [](std::string p) {
+            for (size_t i = 0; (i = p.find(' ', i)) != std::string::npos; i += 2) {
+                p.insert(i, "\\");
+            }
+            return p;
+        };
+        write_binary_file(target_cpp + ".d", escape(target_cpp) + ": " + escape(input_filepath) + "\n");
+    }
 
     if (compile_failed) {
         std::cerr << "vulkan-shaders-gen: one or more shaders failed to compile" << std::endl;

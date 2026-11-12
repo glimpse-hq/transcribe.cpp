@@ -84,7 +84,10 @@ struct SessionCore {
     // (Handy #2000). Families re-create the scheduler lazily on the next run.
     // The measured recreation cost is about 1 ms per run on Metal and up to
     // about 10 ms on CPU for families that reserve a worst-case decoder
-    // workspace each run, such as Canary and Cohere.
+    // workspace each run, such as Canary and Cohere. On Vulkan it is 14 to
+    // 60 ms for 1 to 10 s Parakeet clips (a fresh device allocation each run),
+    // so a scheduler whose buffers total at most 64 MiB is only reset and
+    // kept for the next run; the compute context is freed either way.
     //
     // Host-side vectors that scale with input length, such as mel buffers,
     // encoder host copies, and positional banks, deliberately retain their

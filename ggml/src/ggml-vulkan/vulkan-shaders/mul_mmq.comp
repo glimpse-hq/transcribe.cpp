@@ -90,9 +90,7 @@ layout (constant_id = 10) const uint WARP = 32;
 #ifdef MUL_MAT_ID
 #define BK_STEP 1
 #else
-#ifndef BK_STEP
-#define BK_STEP 4
-#endif
+layout (constant_id = 11) const uint BK_STEP = 4;
 #endif
 
 // Shared memory cache

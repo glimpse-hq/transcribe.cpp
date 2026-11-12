@@ -1,0 +1,179 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3eacd4cd..7ec5e57a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -274,6 +274,7 @@ option(GGML_HEXAGON                         "ggml: enable Hexagon backend"
+ 
+ # toolchain for vulkan-shaders-gen
+ set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
++set   (GGML_VULKAN_SHADER_TYPES "" CACHE STRING "ggml: Vulkan shader types to build (empty: all)")
+ 
+ option(GGML_ZENDNN                          "ggml: use ZenDNN"                                OFF)
+ option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")
+diff --git a/src/ggml-vulkan/CMakeLists.txt b/src/ggml-vulkan/CMakeLists.txt
+index d7dec92a..4e3cda6f 100644
+--- a/src/ggml-vulkan/CMakeLists.txt
++++ b/src/ggml-vulkan/CMakeLists.txt
+@@ -224,11 +224,17 @@ if (Vulkan_FOUND)
+               CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
+                                 "${_ggml_vk_input_dir}/*.h")
+ 
++    if (GGML_VULKAN_SHADER_TYPES)
++        string(REPLACE ";" "," _ggml_vk_types "${GGML_VULKAN_SHADER_TYPES}")
++        set(_ggml_vk_types_arg --types ${_ggml_vk_types})
++    endif()
++
+     add_custom_command(
+         OUTPUT ${_ggml_vk_header}
+         COMMAND ${_ggml_vk_genshaders_cmd}
+             --output-dir ${_ggml_vk_output_dir}
+             --target-hpp ${_ggml_vk_header}
++            ${_ggml_vk_types_arg}
+         DEPENDS ${_ggml_vk_shaders_gen_sources}
+                 vulkan-shaders-gen
+         COMMENT "Generate vulkan shaders header"
+@@ -248,6 +254,7 @@ if (Vulkan_FOUND)
+                 --output-dir ${_ggml_vk_output_dir}
+                 --target-hpp ${_ggml_vk_header}
+                 --target-cpp ${_ggml_vk_target_cpp}
++                ${_ggml_vk_types_arg}
+             DEPENDS ${file_full}
+                     ${_ggml_vk_shaders_gen_sources}
+                     vulkan-shaders-gen
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 5587dfc2..511f0478 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -583,6 +583,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
+     GGML_ASSERT(parameter_count > 0);
+     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
+     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
++    if (spv_size == 0) {
++        GGML_ABORT("ggml_vulkan: shader %s is not in this build (GGML_VULKAN_SHADER_TYPES)", pipeline->name.c_str());
++    }
+ 
+     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
+ 
+@@ -15321,6 +15324,19 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const
+     return ggml_backend_vk_init(ctx->device);
+ }
+ 
++static bool ggml_vk_type_built(ggml_type type) {
++    static const std::array<bool, GGML_TYPE_COUNT> built = [] {
++        std::array<bool, GGML_TYPE_COUNT> b;
++        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
++            std::string name = std::string(",") + ggml_type_name((ggml_type) t) + ",";
++            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
++            b[t] = strstr(GGML_VK_PRUNED_TYPES, name.c_str()) == nullptr;
++        }
++        return b;
++    }();
++    return built[type];
++}
++
+ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+     const vk_device& device = ggml_vk_get_device(ctx->device);
+@@ -15342,12 +15358,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+         return true;
+     };
+     // reject any tensors larger than the max buffer size
++    // Views and no-ops need no shader, so a weight of a type without shaders can still be read by the CPU backend.
++    const bool needs_shader = !ggml_op_is_empty(op->op);
+     for (int i = 0; i < GGML_MAX_SRC; i++) {
+-        if (op->src[i] && !tensor_size_supported(ggml_nbytes(op->src[i]))) {
++        if (op->src[i] && (!tensor_size_supported(ggml_nbytes(op->src[i])) || (needs_shader && !ggml_vk_type_built(op->src[i]->type)))) {
+             return false;
+         }
+     }
+-    if (!tensor_size_supported(ggml_nbytes(op))) {
++    if (!tensor_size_supported(ggml_nbytes(op)) || (needs_shader && !ggml_vk_type_built(op->type))) {
+         return false;
+     }
+ 
+diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 7597b3d3..814f259e 100644
+--- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -45,6 +45,7 @@ std::string input_filepath = "";
+ std::string output_dir = "/tmp";
+ std::string target_hpp = "";
+ std::string target_cpp = "";
++std::vector<std::string> pruned_types;
+ 
+ const std::vector<std::string> type_names = {
+     "f32",
+@@ -446,6 +447,15 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
+         return;
+     }
+ 
++    const std::string tokens = "_" + name + "_";
++    for (const auto& t : pruned_types) {
++        if (tokens.find("_" + t + "_") != std::string::npos) {
++            std::lock_guard<std::mutex> guard(lock);
++            shader_fnames.push_back(std::pair(name, ""));
++            return;
++        }
++    }
++
+     compile_count_guard slot = acquire_compile_slot();
+     compiles.push_back(std::async(
+         string_to_spv_func, name, input_filepath, out_path, defines, coopmat, generate_dep_file, std::move(slot)));
+@@ -1244,6 +1254,11 @@ void write_output_files() {
+     std::stringstream src = make_generic_stringstream();
+ 
+     hdr << "#include <cstdint>\n\n";
++    hdr << "#define GGML_VK_PRUNED_TYPES \",";
++    for (const auto& t : pruned_types) {
++        hdr << t << ",";
++    }
++    hdr << "\"\n\n";
+     src << "#include \"" << basename(target_hpp) << "\"\n\n";
+ 
+     std::sort(shader_fnames.begin(), shader_fnames.end());
+@@ -1259,7 +1274,10 @@ void write_output_files() {
+         hdr << "extern const uint64_t " << name << "_len;\n";
+         hdr << "extern const unsigned char " << name << "_data[];\n\n";
+ 
+-        if (input_filepath != "") {
++        if (input_filepath != "" && path.empty()) {
++            src << "const uint64_t " << name << "_len = 0;\n";
++            src << "const unsigned char " << name << "_data[1] = {};\n\n";
++        } else if (input_filepath != "") {
+             std::string data = read_binary_file(path);
+             if (data.empty()) {
+                 continue;
+@@ -1417,6 +1435,15 @@ int main(int argc, char** argv) {
+     if (args.find("--target-cpp") != args.end()) {
+         target_cpp = args["--target-cpp"]; // Path to generated cpp file
+     }
++    if (args.find("--types") != args.end()) {
++        // Comma-separated types to build; f32 and f16 are always built.
++        const std::string types = "," + args["--types"] + ",";
++        for (const auto& t : type_names) {
++            if (t != "f32" && t != "f16" && types.find("," + t + ",") == std::string::npos) {
++                pruned_types.push_back(t);
++            }
++        }
++    }
+ 
+     if (!directory_exists(output_dir)) {
+         if (!create_directory(output_dir)) {
+@@ -1427,6 +1454,17 @@ int main(int argc, char** argv) {
+ 
+     process_shaders();
+ 
++    // Every variant of this source was pruned, so no compile wrote the depfile CMake expects.
++    if (target_cpp != "" && generate_dep_file) {
++        auto escape = [](std::string p) {
++            for (size_t i = 0; (i = p.find(' ', i)) != std::string::npos; i += 2) {
++                p.insert(i, "\\");
++            }
++            return p;
++        };
++        write_binary_file(target_cpp + ".d", escape(target_cpp) + ": " + escape(input_filepath) + "\n");
++    }
++
+     if (compile_failed) {
+         std::cerr << "vulkan-shaders-gen: one or more shaders failed to compile" << std::endl;
+         return EXIT_FAILURE;
