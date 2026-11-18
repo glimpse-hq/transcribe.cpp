@@ -454,7 +454,7 @@ void test_raw_text_single_batch_and_alias() {
 // public call, and never on a pre-clear rejection.
 // ---------------------------------------------------------------------------
 
-// release_scratch itself is non-virtual on the base (it always frees the
+// release_scratch itself is non-virtual on the base (it frees or resets the
 // base-owned sched/compute_ctx, both null here); count via the family hook
 // it invokes afterwards.
 struct CountingSession final : public transcribe_session {

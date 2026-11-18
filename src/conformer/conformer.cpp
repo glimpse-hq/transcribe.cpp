@@ -838,9 +838,12 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
 
     // A full-attention flash mask has an independent relative-position
     // matmul for each head. Build and narrow those one head at a time so
-    // the allocator never needs the [2*T-1, T, H] F32 result at once.
+    // the allocator never needs a large [2*T-1, T, H] F32 result at once.
+    // Below 16 MiB one matmul is cheaper than 5 small ops per head (9 of
+    // 190 ms for a 1 s Parakeet clip on Intel Vulkan).
     // Masked/local cases retain the common path below.
-    const bool    split_flash_mask = flash && !is_local && !is_chunked && params.attn_pad_mask == nullptr;
+    const bool    split_flash_mask = flash && !is_local && !is_chunked && params.attn_pad_mask == nullptr &&
+                                  pos_len * T_q * n_head * B * static_cast<int64_t>(sizeof(float)) > (16 << 20);
     ggml_tensor * matrix_bd        = nullptr;
     if (split_flash_mask) {
         for (int h = 0; h < n_head; ++h) {

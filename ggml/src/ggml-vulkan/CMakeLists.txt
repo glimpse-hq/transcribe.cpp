@@ -224,11 +224,17 @@ if (Vulkan_FOUND)
               CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
                                 "${_ggml_vk_input_dir}/*.h")
 
+    if (GGML_VULKAN_SHADER_TYPES)
+        string(REPLACE ";" "," _ggml_vk_types "${GGML_VULKAN_SHADER_TYPES}")
+        set(_ggml_vk_types_arg --types ${_ggml_vk_types})
+    endif()
+
     add_custom_command(
         OUTPUT ${_ggml_vk_header}
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            ${_ggml_vk_types_arg}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
         COMMENT "Generate vulkan shaders header"
@@ -248,6 +254,7 @@ if (Vulkan_FOUND)
                 --output-dir ${_ggml_vk_output_dir}
                 --target-hpp ${_ggml_vk_header}
                 --target-cpp ${_ggml_vk_target_cpp}
+                ${_ggml_vk_types_arg}
             DEPENDS ${file_full}
                     ${_ggml_vk_shaders_gen_sources}
                     vulkan-shaders-gen

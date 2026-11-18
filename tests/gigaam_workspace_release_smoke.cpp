@@ -1,8 +1,10 @@
-// Real-model regression test: the dispatcher releases the per-run compute
-// scratch after every offline run / batch (transcribe_session::release_scratch),
-// so a long utterance cannot pin its workspace for the session's lifetime, and
-// the scheduler rebuild does not change numerics.
+// Real-model regression test: after an offline run / batch the dispatcher keeps
+// the scheduler only while its buffers total at most 64 MiB and releases it
+// otherwise (transcribe_session::release_scratch), so a long utterance cannot
+// pin a large workspace for the session's lifetime, and neither keeping nor
+// rebuilding the scheduler changes numerics.
 
+#include "ggml-backend.h"
 #include "transcribe-session.h"  // base-owned sched (internal header)
 #include "transcribe.h"
 
@@ -32,6 +34,25 @@ std::vector<float> make_pcm(double seconds) {
 
 bool sched_live(const transcribe_session * s) {
     return s->sched != nullptr;  // owned by the base session, family-agnostic
+}
+
+size_t sched_bytes(const transcribe_session * s) {
+    size_t total = 0;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(s->sched); ++i) {
+        total += ggml_backend_sched_get_buffer_size(s->sched, ggml_backend_sched_get_backend(s->sched, i));
+    }
+    return total;
+}
+
+// A kept scheduler must fit the 64 MiB limit; a released one needs no check.
+bool sched_within_limit(const char * what, const transcribe_session * s) {
+    if (!sched_live(s)) {
+        std::printf("%s: scheduler released\n", what);
+        return true;
+    }
+    const size_t bytes = sched_bytes(s);
+    std::printf("%s: scheduler kept, %.1f MiB\n", what, static_cast<double>(bytes) / (1 << 20));
+    return bytes <= (size_t{ 64 } << 20);
 }
 
 int fail(const char * what) {
@@ -67,30 +88,29 @@ int main() {
         return fail("short run #1");
     }
     const std::string text_before = transcribe_full_text(s) ? transcribe_full_text(s) : "";
-    if (sched_live(s)) {
-        return fail("short run #1: expected the scheduler to be released");
+    if (!sched_live(s)) {
+        return fail("short run #1: expected the scheduler to be kept");
     }
-    std::printf("short run #1: scheduler released\n");
+    std::printf("short run #1: scheduler kept\n");
 
     if (transcribe_run(s, long_pcm.data(), static_cast<int>(long_pcm.size()), nullptr) != TRANSCRIBE_OK) {
         return fail("long run");
     }
-    if (sched_live(s)) {
-        return fail("long run: expected the scheduler to be released");
+    if (!sched_within_limit("long run", s)) {
+        return fail("long run: kept a scheduler over 64 MiB");
     }
-    std::printf("long run: scheduler released\n");
 
     if (transcribe_run(s, short_pcm.data(), static_cast<int>(short_pcm.size()), nullptr) != TRANSCRIBE_OK) {
         return fail("short run #2");
     }
     const std::string text_after = transcribe_full_text(s) ? transcribe_full_text(s) : "";
-    if (sched_live(s)) {
-        return fail("short run #2: expected the scheduler to be released");
+    if (!sched_live(s)) {
+        return fail("short run #2: expected the scheduler to be kept");
     }
-    std::printf("short run #2: scheduler released\n");
+    std::printf("short run #2: scheduler kept\n");
     if (text_after != text_before) {
         std::fprintf(stderr, "before: '%s'\nafter:  '%s'\n", text_before.c_str(), text_after.c_str());
-        return fail("short run #2: transcript changed after the scheduler rebuild");
+        return fail("short run #2: transcript changed after the long run");
     }
 
     const float * pcms[2] = { long_pcm.data(), long_pcm.data() };
@@ -98,18 +118,17 @@ int main() {
     if (transcribe_run_batch(s, pcms, lens, 2, nullptr) != TRANSCRIBE_OK) {
         return fail("batch run");
     }
-    if (sched_live(s)) {
-        return fail("batch run: expected the scheduler to be released");
+    if (!sched_within_limit("batch run", s)) {
+        return fail("batch run: kept a scheduler over 64 MiB");
     }
-    std::printf("batch run: scheduler released\n");
 
     if (transcribe_run(s, short_pcm.data(), static_cast<int>(short_pcm.size()), nullptr) != TRANSCRIBE_OK) {
         return fail("short run #3");
     }
-    if (sched_live(s)) {
-        return fail("short run #3: expected the scheduler to be released");
+    if (!sched_live(s)) {
+        return fail("short run #3: expected the scheduler to be kept");
     }
-    std::printf("short run #3: scheduler released\n");
+    std::printf("short run #3: scheduler kept\n");
 
     transcribe_close(s);
     std::printf("gigaam_workspace_release_smoke: OK\n");

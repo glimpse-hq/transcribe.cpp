@@ -653,13 +653,12 @@ transcribe_status run_whisper_encoder_on_window(WhisperSession * cc,
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper run: ggml_backend_sched_new failed");
             return TRANSCRIBE_ERR_BACKEND;
         }
-
-        // Apply the caller's CPU thread count once at sched creation; it
-        // persists across the reused encoder/decoder graphs. GPU backends
-        // ignore it, CPU/BLAS use it. Without this, compute ran at ggml's
-        // default count regardless of params.n_threads.
-        transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
     }
+    // Apply the caller's CPU thread count every run: the backends are shared
+    // by the model's sessions and a kept scheduler outlives this one. GPU
+    // backends ignore it, CPU/BLAS use it. Without this, compute ran at ggml's
+    // default count regardless of params.n_threads.
+    transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
 
 #ifdef TRANSCRIBE_COREML
     if (cc->coreml_encoder != nullptr) {
