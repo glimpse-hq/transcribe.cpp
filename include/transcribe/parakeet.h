@@ -114,27 +114,31 @@ TRANSCRIBE_API void transcribe_parakeet_buffered_stream_ext_init(struct transcri
  *
  *   boost_phrases / n_boost_phrases
  *
- *     UTF-8 phrases to favor, as typed (casing matters: the model emits
- *     cased text, so "Groq" boosts "Groq"). Borrowed for the call; the
+ *     UTF-8 phrases to favor, as typed. Borrowed for the call; the
  *     library copies what it needs. NULL / 0 disables boosting and the
  *     output is identical to passing no extension. At most 1024
  *     phrases; more, or a NULL entry, is TRANSCRIBE_ERR_INVALID_ARG.
- *     Whitespace is trimmed and collapsed. Phrases of fewer than 3
- *     characters or more than 256 bytes, longer than 24 tokens, or that
- *     do not tokenize to plain vocabulary pieces, are ignored.
  *
  *   boost_score
  *
- *     Boost weight in logits per phrase-trie arc score. Default 3.0;
- *     0 disables. Must be finite and in [0, 10].
+ *     Boost weight. Default 3.0; 0 disables. Must be finite and in
+ *     [0, 10].
  *
- * Offline runs boost the phrases as transcribe_run_params::vocabulary
- * terms (see docs/prompting.md), with boost_score as the per-token bonus.
- * Streams keep the model's blank decisions; a boosted token must have at
- * least 1e-5 unboosted probability, and a swap is kept only when it
- * completes a phrase as whole words and the decode keeps emitting speech
- * for half a second after it; otherwise the model's own tokens stand for
- * that span.
+ * Offline runs add the phrases to transcribe_run_params::vocabulary and
+ * boost them the same way (docs/prompting.md): a phrase also matches with
+ * its first letter's case flipped, and each matched token after its first
+ * earns boost_score in logits. A positive boost_score is then the bonus
+ * for the run's vocabulary terms too.
+ *
+ * Streams build a phrase trie scored like NeMo's GPU phrase boosting.
+ * Casing matters there ("Groq" boosts "Groq"); whitespace is trimmed and
+ * collapsed; phrases of fewer than 3 characters or more than 256 bytes,
+ * longer than 24 tokens, or that do not tokenize to plain vocabulary
+ * pieces, are ignored. Decoding keeps the model's blank decisions; a
+ * boosted token must have at least 1e-7 unboosted probability, and a
+ * swap is kept only when it completes a phrase as whole words and the
+ * decode keeps emitting speech for half a second after it; otherwise the
+ * model's own tokens stand for that span.
  */
 struct transcribe_parakeet_run_ext {
     struct transcribe_ext ext;

@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 3eacd4cd..7ec5e57a 100644
+index b1018cb..2fa1beb 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -274,6 +274,7 @@ option(GGML_HEXAGON                         "ggml: enable Hexagon backend"
+@@ -275,6 +275,7 @@ option(GGML_HEXAGON                         "ggml: enable Hexagon backend"
  
  # toolchain for vulkan-shaders-gen
  set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
@@ -11,10 +11,10 @@ index 3eacd4cd..7ec5e57a 100644
  option(GGML_ZENDNN                          "ggml: use ZenDNN"                                OFF)
  option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")
 diff --git a/src/ggml-vulkan/CMakeLists.txt b/src/ggml-vulkan/CMakeLists.txt
-index d7dec92a..4e3cda6f 100644
+index 682b90e..6121c5b 100644
 --- a/src/ggml-vulkan/CMakeLists.txt
 +++ b/src/ggml-vulkan/CMakeLists.txt
-@@ -224,11 +224,17 @@ if (Vulkan_FOUND)
+@@ -225,11 +225,17 @@ if (Vulkan_FOUND)
                CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
                                  "${_ggml_vk_input_dir}/*.h")
  
@@ -32,7 +32,7 @@ index d7dec92a..4e3cda6f 100644
          DEPENDS ${_ggml_vk_shaders_gen_sources}
                  vulkan-shaders-gen
          COMMENT "Generate vulkan shaders header"
-@@ -248,6 +254,7 @@ if (Vulkan_FOUND)
+@@ -249,6 +255,7 @@ if (Vulkan_FOUND)
                  --output-dir ${_ggml_vk_output_dir}
                  --target-hpp ${_ggml_vk_header}
                  --target-cpp ${_ggml_vk_target_cpp}
@@ -41,10 +41,10 @@ index d7dec92a..4e3cda6f 100644
                      ${_ggml_vk_shaders_gen_sources}
                      vulkan-shaders-gen
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index 5587dfc2..511f0478 100644
+index 22641f5..3a4b2d2 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -583,6 +583,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
+@@ -580,6 +580,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
      GGML_ASSERT(parameter_count > 0);
      GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
      GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
@@ -54,7 +54,7 @@ index 5587dfc2..511f0478 100644
  
      vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
  
-@@ -15321,6 +15324,19 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const
+@@ -15892,6 +15895,19 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const
      return ggml_backend_vk_init(ctx->device);
  }
  
@@ -74,25 +74,25 @@ index 5587dfc2..511f0478 100644
  static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
      const vk_device& device = ggml_vk_get_device(ctx->device);
-@@ -15342,12 +15358,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -15913,13 +15929,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
          return true;
      };
-     // reject any tensors larger than the max buffer size
-+    // Views and no-ops need no shader, so a weight of a type without shaders can still be read by the CPU backend.
-+    const bool needs_shader = !ggml_op_is_empty(op->op);
+     // non-compute ops are never executed here; their size is bounded by the buffer allocation limit
++    // and they need no shader, so a weight of a type without shaders can still be read by the CPU backend.
+     const bool non_compute = ggml_op_is_empty(op->op);
      for (int i = 0; i < GGML_MAX_SRC; i++) {
--        if (op->src[i] && !tensor_size_supported(ggml_nbytes(op->src[i]))) {
-+        if (op->src[i] && (!tensor_size_supported(ggml_nbytes(op->src[i])) || (needs_shader && !ggml_vk_type_built(op->src[i]->type)))) {
+-        if (op->src[i] && !non_compute && !tensor_size_supported(ggml_nbytes(op->src[i]))) {
++        if (op->src[i] && !non_compute && (!tensor_size_supported(ggml_nbytes(op->src[i])) || !ggml_vk_type_built(op->src[i]->type))) {
              return false;
          }
      }
--    if (!tensor_size_supported(ggml_nbytes(op))) {
-+    if (!tensor_size_supported(ggml_nbytes(op)) || (needs_shader && !ggml_vk_type_built(op->type))) {
+-    if (!non_compute && !tensor_size_supported(ggml_nbytes(op))) {
++    if (!non_compute && (!tensor_size_supported(ggml_nbytes(op)) || !ggml_vk_type_built(op->type))) {
          return false;
      }
  
 diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index 7597b3d3..814f259e 100644
+index 7ccccfa..1b6d81b 100644
 --- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 @@ -45,6 +45,7 @@ std::string input_filepath = "";
@@ -119,7 +119,7 @@ index 7597b3d3..814f259e 100644
      compile_count_guard slot = acquire_compile_slot();
      compiles.push_back(std::async(
          string_to_spv_func, name, input_filepath, out_path, defines, coopmat, generate_dep_file, std::move(slot)));
-@@ -1244,6 +1254,11 @@ void write_output_files() {
+@@ -1256,6 +1266,11 @@ void write_output_files() {
      std::stringstream src = make_generic_stringstream();
  
      hdr << "#include <cstdint>\n\n";
@@ -131,7 +131,7 @@ index 7597b3d3..814f259e 100644
      src << "#include \"" << basename(target_hpp) << "\"\n\n";
  
      std::sort(shader_fnames.begin(), shader_fnames.end());
-@@ -1259,7 +1274,10 @@ void write_output_files() {
+@@ -1271,7 +1286,10 @@ void write_output_files() {
          hdr << "extern const uint64_t " << name << "_len;\n";
          hdr << "extern const unsigned char " << name << "_data[];\n\n";
  
@@ -143,7 +143,7 @@ index 7597b3d3..814f259e 100644
              std::string data = read_binary_file(path);
              if (data.empty()) {
                  continue;
-@@ -1417,6 +1435,15 @@ int main(int argc, char** argv) {
+@@ -1429,6 +1447,15 @@ int main(int argc, char** argv) {
      if (args.find("--target-cpp") != args.end()) {
          target_cpp = args["--target-cpp"]; // Path to generated cpp file
      }
@@ -159,7 +159,7 @@ index 7597b3d3..814f259e 100644
  
      if (!directory_exists(output_dir)) {
          if (!create_directory(output_dir)) {
-@@ -1427,6 +1454,17 @@ int main(int argc, char** argv) {
+@@ -1439,6 +1466,17 @@ int main(int argc, char** argv) {
  
      process_shaders();
  

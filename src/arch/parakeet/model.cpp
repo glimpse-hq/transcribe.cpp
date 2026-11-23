@@ -2151,6 +2151,8 @@ transcribe_status run(transcribe_session *          session,
     }
 
     pc->clear_result();
+    // Multitalker passes decode as streams, which boost with the trie.
+    compile_boost(pc, pm, params);
 
     // Multitalker bundle: diarize=ON routes through the embedded-sortformer
     // orchestrator (per-speaker passes + merged speaker-tagged result).

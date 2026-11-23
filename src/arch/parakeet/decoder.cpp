@@ -324,8 +324,6 @@ struct JointGraph {
     ggml_tensor *         pred_in = nullptr;  // [pred_hidden] fp32 input (decoder out)
     ggml_tensor *         enc_in  = nullptr;  // [joint_h] fp32 input (enc_proj frame)
     ggml_tensor *         logits  = nullptr;  // [joint_n] fp32 output
-    ggml_tensor *         probs   = nullptr;  // [n_probs] softmax of the token logits (n_probs > 0)
-    ggml_tensor *         mean    = nullptr;  // [1] token logits averaged under probs (n_probs > 0)
     bool                  ready   = false;
 
     JointGraph() = default;
@@ -347,7 +345,7 @@ struct JointGraph {
 // Build the full joint graph on the shared `backend` (PredGraph's pool).
 // Returns false if the resident weights are absent or any ggml step
 // fails (→ hard decode error).
-bool build_joint_graph(JointGraph & g, const HostJoint & j, ggml_backend_t backend, int n_probs = 0) {
+bool build_joint_graph(JointGraph & g, const HostJoint & j, ggml_backend_t backend) {
     if (backend == nullptr) {
         return false;
     }
@@ -405,13 +403,6 @@ bool build_joint_graph(JointGraph & g, const HostJoint & j, ggml_backend_t backe
     ggml_tensor * mm = ggml_mul_mat(g.ctx, j.gw_w, activated);
     g.logits         = ggml_add(g.ctx, mm, j.gw_b);
     ggml_set_output(g.logits);
-    if (n_probs > 0) {
-        ggml_tensor * tok = ggml_view_1d(g.ctx, g.logits, n_probs, 0);
-        g.probs           = ggml_soft_max(g.ctx, tok);
-        g.mean            = ggml_sum_rows(g.ctx, ggml_mul(g.ctx, g.probs, tok));
-        ggml_set_output(g.probs);
-        ggml_set_output(g.mean);
-    }
 
     g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, g.backend);
     if (g.buf == nullptr) {
@@ -420,9 +411,6 @@ bool build_joint_graph(JointGraph & g, const HostJoint & j, ggml_backend_t backe
 
     g.graph = ggml_new_graph(g.ctx);
     ggml_build_forward_expand(g.graph, g.logits);
-    if (n_probs > 0) {
-        ggml_build_forward_expand(g.graph, g.mean);
-    }
     g.ready = true;
     return true;
 }
@@ -1558,6 +1546,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights &      w,
 
     // Vocabulary biasing state; untouched when no terms were given.
     int                boost_state = transcribe::PhraseBoost::root;
+    int                frame_boost = transcribe::PhraseBoost::root;
     std::vector<float> boosted;
 
     // See ParakeetHParams::tdt_global_symbol_budget.
@@ -1633,6 +1622,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights &      w,
             if (duration == 0 && (out_tokens.empty() || out_tokens.back().step_at_emit != step)) {
                 frame.state      = state;
                 frame.last_token = last_token;
+                frame_boost      = boost_state;
             }
             out_tokens.push_back(tok);
 
@@ -1667,6 +1657,17 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights &      w,
                     return TRANSCRIBE_ERR_BACKEND;
                 }
                 predictor_dirty = true;
+                if (boost != nullptr) {
+                    // Replay the frame's kept tokens so the dropped loop leaves no partial match.
+                    boost_state  = frame_boost;
+                    size_t first = out_tokens.size();
+                    while (first > 0 && out_tokens[first - 1].step_at_emit == step) {
+                        --first;
+                    }
+                    for (size_t i = first; i < out_tokens.size(); ++i) {
+                        boost_state = boost->next(boost_state, out_tokens[i].id);
+                    }
+                }
             }
             step += 1;
             new_symbols = 0;
