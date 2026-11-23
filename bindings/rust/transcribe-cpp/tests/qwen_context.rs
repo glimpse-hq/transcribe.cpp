@@ -36,16 +36,12 @@ fn context_is_per_request_and_works_in_batches() {
     let hints = with_context("Kennedy, Americans, Glimpse, José, 東京.");
     assert!(!session.run(&audio, &hints).unwrap().text.is_empty());
     let batch = session.run_batch(&[&audio, &audio], &hints).unwrap();
-    assert!(
-        batch
-            .iter()
-            .all(|r| r.as_ref().is_ok_and(|r| !r.text.is_empty()))
-    );
-    assert!(
-        session
-            .run(&audio, &with_context(&"x".repeat(4097)))
-            .is_err()
-    );
+    assert!(batch
+        .iter()
+        .all(|r| r.as_ref().is_ok_and(|r| !r.text.is_empty())));
+    assert!(session
+        .run(&audio, &with_context(&"x".repeat(4097)))
+        .is_err());
     assert!(session.run(&audio, &with_context("bad\0context")).is_err());
     assert_eq!(session.run(&audio, &plain).unwrap().text, baseline);
 }
