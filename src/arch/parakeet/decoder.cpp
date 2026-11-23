@@ -20,6 +20,8 @@
 #include "transcribe-repetition-guard.h"
 #include "weights.h"
 
+#include <limits>
+
 // ggml-backend.h, not ggml-cpu.h: under GGML_BACKEND_DL the CPU backend
 // is a loadable module, so backend-specific entry points must be reached
 // through the registry (ggml_backend_init_by_type / get_proc_address),
@@ -1030,6 +1032,31 @@ int argmax_range(const float * data, int n) {
     return best_i;
 }
 
+// Token argmax, biased toward the vocabulary when there is one.
+//
+// The model alone decides between blank and a token: only when its own
+// argmax emits something does the vocabulary re-rank the non-blank tokens.
+// Biasing can then change which word is written but never whether one is,
+// so it cannot invent speech on silence or noise. The model's own logits are
+// left untouched for the confidence that follows.
+static int biased_argmax(const float *                   token_logits,
+                         int                             n_token_cls,
+                         int                             blank_id,
+                         const transcribe::PhraseBoost * boost,
+                         int                             boost_state,
+                         std::vector<float> &            scratch) {
+    const int unbiased = argmax_range(token_logits, n_token_cls);
+    if (boost == nullptr || boost->empty() || unbiased == blank_id) {
+        return unbiased;
+    }
+    scratch.assign(token_logits, token_logits + n_token_cls);
+    boost->apply(boost_state, scratch.data(), n_token_cls, blank_id);
+    if (blank_id >= 0 && blank_id < n_token_cls) {
+        scratch[static_cast<size_t>(blank_id)] = -std::numeric_limits<float>::infinity();
+    }
+    return argmax_range(scratch.data(), n_token_cls);
+}
+
 // Entropy-based confidence over a token-logit slice. Mirrors the
 // reference ParakeetTDT.decode_greedy path:
 //
@@ -1438,353 +1465,19 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
     return TRANSCRIBE_OK;
 }
 
-transcribe_status decode_boosted_offline(const HostDecoderWeights & w,
-                                         const float *              enc_out,
-                                         int                        T_enc,
-                                         int                        d_enc,
-                                         int                        n_threads,
-                                         const BoostTrie &          trie,
-                                         std::vector<TdtToken> &    out_tokens) {
-    const int        n_layers = static_cast<int>(w.predictor.lstm.size());
-    GreedyCursor     main;
-    BoostDecodeState bs;
-    main.state.reset(n_layers, w.predictor.pred_hidden);
-    main.next_state.reset(n_layers, w.predictor.pred_hidden);
-    return decode_boosted(w, enc_out, T_enc, d_enc, n_threads, trie, main, bs, 0, /*end_of_audio=*/true, out_tokens);
-}
-
-// TDT beam search with shallow-fusion phrase boosting, used for offline
-// decodes when phrases are set. Each hypothesis takes the greedy choice and,
-// on a non-blank step, also forks to the trie's next tokens (probability at
-// least k_boost_floor). Hypotheses wait at their frame; a frame's group is
-// cut to k_boost_beam within k_boost_beam_margin of the best, the greedy one
-// kept. A hypothesis scores log p(token) + log p(duration) plus the beam's
-// boost weight times the trie's score change (BoostTrie::advance). A partial
-// match is taken back when it stalls for k_boost_guard_frames or the audio
-// ends; a phrase earns nothing restarting in the frame it completed in or
-// repeating itself. When all hypotheses share a frame with no match open or
-// fresh, the best one that did not drop words against the greedy one
-// (boost_guard_passed) wins. A frame that hits max_symbols on a repeating
-// tail hands the decode to greedy boosting, which carries the repeat guard.
-transcribe_status decode_beam_offline(const HostDecoderWeights & w,
-                                      const float *              enc_out,
-                                      int                        T_enc,
-                                      int                        d_enc,
-                                      int                        n_threads,
-                                      const BoostTrie &          trie,
-                                      std::vector<TdtToken> &    out_tokens) {
-    const int   n_token_cls = w.predictor.pred_vocab;
-    const int   n_dur       = static_cast<int>(w.tdt_durations.size());
-    const int   blank_id    = w.blank_id;
-    const int   joint_h     = w.joint.joint_h;
-    const int   max_sym     = w.tdt_max_symbols;
-    const int   beam        = k_boost_beam;
-    const float lambda      = trie.lambda * k_boost_beam_weight;
-
-    PredGraph  pg;
-    JointGraph jg;
-    build_pred_graph(pg, w.predictor, resolve_decode_threads(n_threads));
-    if (pg.ready) {
-        build_joint_graph(jg, w.joint, pg.backend, n_token_cls);
-    }
-    if (!pg.ready || !jg.ready) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: ggml decode graph build failed");
-        return TRANSCRIBE_ERR_BACKEND;
-    }
-    std::vector<float> enc_proj_all;
-    if (!precompute_enc_proj_ggml(w.joint, pg.backend, enc_out, T_enc, d_enc, enc_proj_all)) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: enc_proj graph failed");
-        return TRANSCRIBE_ERR_BACKEND;
-    }
-
-    // Emitted tokens as a tree; a hypothesis points at its last one.
-    struct Emitted {
-        TdtToken tok;
-        int      prev;
-    };
-
-    struct Hyp {
-        std::shared_ptr<const LstmState> state;  // after last_token, or before it while dirty
-        float                            score       = 0.0f;
-        int                              step        = 0;
-        int                              new_symbols = 0;
-        int                              last_token  = -1;
-        int                              node        = 0;
-        int                              matched_at  = 0;     // frame of the last trie arc
-        int                              ended_at    = -1;    // frame of the last completed phrase
-        int                              last_end    = -1;    // that phrase's node until a plain word follows
-        int                              words       = 0;
-        bool                             plain       = true;  // took only greedy choices
-        int                              tail        = -1;
-        uint64_t                         hash        = 1469598103934665603ULL;
-        bool                             dirty       = true;
-    };
-
-    std::vector<Emitted> emitted;
-    auto                 start = std::make_shared<LstmState>();
-    start->reset(static_cast<int>(w.predictor.lstm.size()), w.predictor.pred_hidden);
-    std::vector<std::vector<Hyp>> at(static_cast<size_t>(T_enc));
-    std::vector<Hyp>              done;
-    at[0].push_back(Hyp{ start });
-
-    // Takes back a partial match.
-    auto unmatch = [&](Hyp & h) {
-        const BoostTrie::Node & n = trie.nodes[static_cast<size_t>(h.node)];
-        if (!n.end) {
-            h.score += lambda * n.chain_backoff;
-        }
-        h.node = 0;
-    };
-    // Same-sequence hypotheses at one place merge (the better score wins).
-    auto place = [](std::vector<Hyp> & dst, Hyp && h) {
-        for (Hyp & o : dst) {
-            if (o.hash == h.hash && o.node == h.node && o.step == h.step) {
-                const bool plain = o.plain || h.plain;
-                if (h.score > o.score) {
-                    o = std::move(h);
-                }
-                o.plain = plain;
-                return;
-            }
-        }
-        dst.push_back(std::move(h));
-    };
-    auto by_score = [](const Hyp & a, const Hyp & b) {
-        return a.score > b.score;
-    };
-    // The best hypothesis that did not drop words against the greedy one (boost_guard_passed).
-    auto best_of = [&](std::vector<Hyp> & v) -> Hyp * {
-        int plain_words = 0;
-        for (const Hyp & h : v) {
-            plain_words = h.plain ? h.words : plain_words;
-        }
-        Hyp * best = nullptr;
-        for (Hyp & h : v) {
-            if (boost_guard_passed(plain_words, h.words) && (best == nullptr || h.score > best->score)) {
-                best = &h;
-            }
-        }
-        return best;
-    };
-    // Whether a TDT frame's tokens, ending in `tail`, loop.
-    auto loops = [&](int tail, int step) {
-        std::vector<int32_t> ids;
-        for (int e = tail; e >= 0 && emitted[static_cast<size_t>(e)].tok.step_at_emit == step;
-             e     = emitted[static_cast<size_t>(e)].prev) {
-            ids.push_back(emitted[static_cast<size_t>(e)].tok.id);
-        }
-        std::reverse(ids.begin(), ids.end());
-        const RepeatBar bar = { max_sym / 2, 2, 0, max_sym, 2 };
-        return repeating_tail_block(ids.data(), static_cast<int>(ids.size()), bar) != 0;
-    };
-
-    const float        log_floor = std::log(k_boost_floor);
-    const float        log_n     = std::log(static_cast<float>(n_token_cls));
-    const size_t       hb        = static_cast<size_t>(w.predictor.pred_hidden) * sizeof(float);
-    std::vector<float> scratch_x, logits(static_cast<size_t>(w.joint.joint_n)), probs(static_cast<size_t>(n_token_cls));
-    std::vector<Hyp>   cur, next;
-    std::vector<int>   cand;
-    const int          max_rounds = 16 * T_enc + 1024;
-    int                max_jump   = 1;
-    for (const int d : w.tdt_durations) {
-        max_jump = std::max(max_jump, d);
-    }
-    int rounds = 0;
-
-    for (int t = 0; t < T_enc; ++t) {
-        cur.swap(at[static_cast<size_t>(t)]);
-        at[static_cast<size_t>(t)].clear();
-        // With every hypothesis here and no match open or fresh, the best one is the decode.
-        bool settled = done.empty();
-        for (int s = t + 1; settled && s < std::min(T_enc, t + max_jump + 1); ++s) {
-            settled = at[static_cast<size_t>(s)].empty();
-        }
-        for (const Hyp & h : cur) {
-            settled = settled && (h.node == 0 || trie.nodes[static_cast<size_t>(h.node)].end) &&
-                      t - h.matched_at > k_boost_guard_frames;
-        }
-        if (settled && cur.size() > 1) {
-            Hyp keep = std::move(*best_of(cur));
-            cur.assign(1, std::move(keep));
-        }
-        if (settled && !cur.empty()) {
-            cur[0].plain = true;  // the greedy baseline from here on
-        }
-        while (!cur.empty()) {
-            if (++rounds > max_rounds) {
-                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder (beam): hit round cap (%d)", max_rounds);
-                return TRANSCRIBE_ERR_BACKEND;
-            }
-            std::sort(cur.begin(), cur.end(), by_score);
-            size_t keep = 1;
-            while (keep < cur.size() && static_cast<int>(keep) < beam &&
-                   cur[keep].score >= cur[0].score - k_boost_beam_margin) {
-                ++keep;
-            }
-            for (size_t i = keep; i < cur.size(); ++i) {
-                if (cur[i].plain) {  // the greedy one stays for the word check
-                    std::swap(cur[keep++], cur[i]);
-                    break;
-                }
-            }
-            cur.resize(keep);
-            next.clear();
-            for (Hyp & h : cur) {
-                if (h.dirty) {
-                    auto fresh = std::make_shared<LstmState>(*h.state);
-                    if (predictor_step_ggml(w.predictor, pg, h.last_token, *h.state, *fresh, scratch_x) == nullptr) {
-                        return TRANSCRIBE_ERR_BACKEND;
-                    }
-                    h.state = std::move(fresh);
-                    h.dirty = false;
-                }
-                float mean = 0.0f;
-                ggml_backend_tensor_set(jg.pred_in, h.state->h.back().data(), 0, hb);
-                ggml_backend_tensor_set(jg.enc_in, enc_proj_all.data() + static_cast<size_t>(t) * joint_h, 0,
-                                        static_cast<size_t>(joint_h) * sizeof(float));
-                if (const ggml_status gs = ggml_backend_graph_compute(jg.backend, jg.graph);
-                    gs != GGML_STATUS_SUCCESS) {
-                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: joint compute failed (%d)",
-                            static_cast<int>(gs));
-                    return TRANSCRIBE_ERR_BACKEND;
-                }
-                ggml_backend_tensor_get(jg.logits, logits.data(), 0, logits.size() * sizeof(float));
-                ggml_backend_tensor_get(jg.probs, probs.data(), 0, probs.size() * sizeof(float));
-                ggml_backend_tensor_get(jg.mean, &mean, 0, sizeof(float));
-                const float * z = logits.data();
-                const float * p = probs.data();
-
-                const int   top  = argmax_range(z, n_token_cls);
-                const float lse  = z[top] - std::log(p[top]);
-                const float conf = 1.0f - (lse - mean) / log_n;
-
-                const float * zd = z + n_token_cls;
-                const int     d  = argmax_range(zd, n_dur);
-                double        sd = 0.0;
-                for (int k = 0; k < n_dur; ++k) {
-                    sd += std::exp(static_cast<double>(zd[k] - zd[d]));
-                }
-                const float lpd = -static_cast<float>(std::log(sd));
-                const int   dur = w.tdt_durations[static_cast<size_t>(d)];
-
-                auto land = [&](Hyp && c) {
-                    if (c.node != 0 && c.step - c.matched_at > k_boost_guard_frames) {
-                        unmatch(c);
-                    }
-                    if (c.step >= T_enc) {
-                        place(done, std::move(c));
-                    } else if (c.step == t) {
-                        place(next, std::move(c));
-                    } else {
-                        place(at[static_cast<size_t>(c.step)], std::move(c));
-                    }
-                };
-
-                // The greedy choice; a non-blank one also forks to the trie's next tokens.
-                cand.clear();
-                if (top == blank_id) {
-                    Hyp b = h;
-                    b.score += z[blank_id] - lse + lpd;
-                    b.step += std::max(dur, 1);  // a zero-duration blank ends up one frame on
-                    b.new_symbols = 0;
-                    land(std::move(b));
-                } else {
-                    cand.push_back(top);
-                }
-                for (int f = h.node; top != blank_id && h.ended_at != t; f = trie.nodes[static_cast<size_t>(f)].fail) {
-                    const BoostTrie::Node & fn = trie.nodes[static_cast<size_t>(f)];
-                    for (int k = 0; k < fn.n_children; ++k) {
-                        const int tok = trie.child_tok[static_cast<size_t>(fn.first_child + k)];
-                        if (z[tok] - lse >= log_floor && std::find(cand.begin(), cand.end(), tok) == cand.end() &&
-                            (trie.token_flags[static_cast<size_t>(tok)] & k_boost_token_special) == 0) {
-                            cand.push_back(tok);
-                        }
-                    }
-                    if (f == 0) {
-                        break;
-                    }
-                }
-
-                for (const int tok : cand) {
-                    Hyp c = h;
-                    c.score += z[tok] - lse + lpd;
-                    const float             gain = trie.advance(c.node, tok);
-                    const BoostTrie::Node & n    = trie.nodes[static_cast<size_t>(c.node)];
-                    if (c.node != 0 && h.ended_at == t && trie.child(0, tok) == c.node) {
-                        c.score += lambda * (gain - n.score);  // no restart in the frame a phrase completed in
-                        c.node = 0;
-                    } else if (n.end && c.node == h.last_end) {
-                        c.score += lambda * (gain - n.score);  // no bonus for a phrase repeating itself
-                        c.node = 0;
-                    } else {
-                        c.score += lambda * gain;
-                    }
-                    if (c.node != 0) {
-                        c.matched_at = t;
-                        if (n.end) {
-                            c.ended_at = t;
-                            c.last_end = c.node;
-                        }
-                    } else if ((trie.token_flags[static_cast<size_t>(tok)] & k_boost_token_word) != 0) {
-                        c.last_end = -1;
-                    }
-                    c.words += (trie.token_flags[static_cast<size_t>(tok)] & k_boost_token_word) != 0;
-                    c.plain      = h.plain && tok == top;
-                    c.dirty      = true;
-                    c.last_token = tok;
-                    c.hash       = (c.hash ^ static_cast<uint64_t>(tok + 1)) * 1099511628211ULL;
-                    TdtToken e;
-                    e.id              = tok;
-                    e.p               = conf;
-                    e.step_at_emit    = t;
-                    e.duration_frames = dur;
-                    emitted.push_back({ e, h.tail });
-                    c.tail = static_cast<int>(emitted.size()) - 1;
-                    if (dur > 0) {
-                        c.step += dur;
-                        c.new_symbols = 0;
-                    } else if (max_sym > 0 && ++c.new_symbols >= max_sym) {
-                        if (repetition_guard_enabled() && loops(c.tail, t)) {
-                            // Rare; greedy boosting trims the loop and rewinds.
-                            return decode_boosted_offline(w, enc_out, T_enc, d_enc, n_threads, trie, out_tokens);
-                        }
-                        c.step += 1;
-                        c.new_symbols = 0;
-                    }
-                    land(std::move(c));
-                }
-            }
-            cur.swap(next);
-        }
-    }
-
-    for (Hyp & h : done) {
-        unmatch(h);
-    }
-    const Hyp *  best  = done.empty() ? nullptr : best_of(done);
-    const size_t first = out_tokens.size();
-    for (int e = best != nullptr ? best->tail : -1; e >= 0; e = emitted[static_cast<size_t>(e)].prev) {
-        out_tokens.push_back(emitted[static_cast<size_t>(e)].tok);
-    }
-    std::reverse(out_tokens.begin() + static_cast<std::ptrdiff_t>(first), out_tokens.end());
-    log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "decoder (beam): %d rounds, %zu tokens, T_enc=%d", rounds,
-            out_tokens.size() - first, T_enc);
-    return TRANSCRIBE_OK;
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // Greedy decode driver
 // ---------------------------------------------------------------------------
 
-transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
-                                    const float *              enc_out,
-                                    int                        T_enc,
-                                    int                        d_enc,
-                                    int                        n_threads,
-                                    const BoostTrie *          boost,
-                                    std::vector<TdtToken> &    out_tokens) {
+transcribe_status decode_tdt_greedy(const HostDecoderWeights &      w,
+                                    const float *                   enc_out,
+                                    int                             T_enc,
+                                    int                             d_enc,
+                                    int                             n_threads,
+                                    std::vector<TdtToken> &         out_tokens,
+                                    const transcribe::PhraseBoost * boost) {
     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1794,9 +1487,6 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                 "expected %d)",
                 d_enc, w.joint.d_enc);
         return TRANSCRIBE_ERR_INVALID_ARG;
-    }
-    if (boost != nullptr && !boost->empty()) {
-        return decode_beam_offline(w, enc_out, T_enc, d_enc, n_threads, *boost, out_tokens);
     }
 
     const int64_t t_setup_start = ggml_time_us();
@@ -1866,6 +1556,10 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
     // the unconditional path.
     bool predictor_dirty = true;
 
+    // Vocabulary biasing state; untouched when no terms were given.
+    int                boost_state = transcribe::PhraseBoost::root;
+    std::vector<float> boosted;
+
     // See ParakeetHParams::tdt_global_symbol_budget.
     const bool global_budget   = w.tdt_global_symbol_budget;
     int64_t    steps_remaining = static_cast<int64_t>(w.tdt_max_symbols) * T_enc;
@@ -1900,7 +1594,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
         const float * token_logits    = logits.data();
         const float * duration_logits = logits.data() + n_token_cls;
 
-        const int pred_token = argmax_range(token_logits, n_token_cls);
+        const int pred_token = biased_argmax(token_logits, n_token_cls, blank_id, boost, boost_state, boosted);
         const int decision   = argmax_range(duration_logits, n_dur);
         const int duration   = w.tdt_durations[static_cast<size_t>(decision)];
 
@@ -1945,6 +1639,9 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
             last_token = pred_token;
             std::swap(state, next_state);  // commit
             predictor_dirty = true;
+            if (boost != nullptr) {
+                boost_state = boost->next(boost_state, pred_token);
+            }
         }
 
         if (global_budget) {
@@ -2030,13 +1727,13 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
 // duration). Matches the reference dump points (`dec.embed.0`,
 // `dec.lstm.{layer}.{h,c}.0`, `dec.joint.0`) emitted on iter 1.
 
-transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
-                                     const float *              enc_out,
-                                     int                        T_enc,
-                                     int                        d_enc,
-                                     int                        n_threads,
-                                     const BoostTrie *          boost,
-                                     std::vector<TdtToken> &    out_tokens) {
+transcribe_status decode_rnnt_greedy(const HostDecoderWeights &      w,
+                                     const float *                   enc_out,
+                                     int                             T_enc,
+                                     int                             d_enc,
+                                     int                             n_threads,
+                                     std::vector<TdtToken> &         out_tokens,
+                                     const transcribe::PhraseBoost * boost) {
     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -2046,9 +1743,6 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                 "expected %d)",
                 d_enc, w.joint.d_enc);
         return TRANSCRIBE_ERR_INVALID_ARG;
-    }
-    if (boost != nullptr && !boost->empty()) {
-        return decode_boosted_offline(w, enc_out, T_enc, d_enc, n_threads, *boost, out_tokens);
     }
 
     const int nt          = resolve_decode_threads(n_threads);
@@ -2100,6 +1794,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
     // RNN-T iters/token ratio.
     bool predictor_dirty = true;
 
+    int                boost_state = transcribe::PhraseBoost::root;
+    std::vector<float> boosted;
+
     while (step < T_enc && iter < max_iters) {
         ++iter;
 
@@ -2126,7 +1823,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
 
         // RNNT joint output is just `n_token_cls` floats (no duration extras).
         const float * token_logits = logits.data();
-        const int     pred_token   = argmax_range(token_logits, n_token_cls);
+        const int     pred_token   = biased_argmax(token_logits, n_token_cls, blank_id, boost, boost_state, boosted);
 
         if (iter == 1 && transcribe::debug::enabled()) {
             const long long s_h = H;
@@ -2161,6 +1858,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
             last_token = pred_token;
             std::swap(state, next_state);
             predictor_dirty = true;
+            if (boost != nullptr) {
+                boost_state = boost->next(boost_state, pred_token);
+            }
 
             new_symbols += 1;
             if (w.tdt_max_symbols > 0 && new_symbols >= w.tdt_max_symbols) {

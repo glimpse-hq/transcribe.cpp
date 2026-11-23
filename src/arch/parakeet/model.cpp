@@ -31,6 +31,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-prompting.h"
 #include "transcribe/parakeet.h"
 #include "weights.h"
 
@@ -45,6 +46,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <ios>
@@ -685,6 +687,10 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         return st;
     }
 
+    // Vocabulary terms bias the greedy transducer decoders (TDT and RNN-T);
+    // CTC heads do not take them yet.
+    transcribe::set_feature(m.get(), TRANSCRIBE_FEATURE_VOCABULARY, m->host_decoder.head_kind != HostHeadKind::CTC);
+
     // Multitalker bundle post-load: fuse the diarizer conformer's BN (needs
     // uploaded data), build its ceil-framed mel frontend, and publish the
     // DIARIZATION capability — for a bundle it is a property of the file.
@@ -849,7 +855,7 @@ static transcribe_status check_boost_ext(const transcribe_run_params * params) {
     return TRANSCRIBE_OK;
 }
 
-// Compile the (validated) PARAKEET_RUN phrases into pc->boost; empty when
+// Compile the (validated) PARAKEET_RUN phrases into pc->boost for a stream; empty when
 // the extension is absent, has no usable phrase, or boost_score is 0.
 static void compile_boost(ParakeetSession * pc, const ParakeetModel * pm, const transcribe_run_params * params) {
     pc->boost                  = BoostTrie{};
@@ -1022,6 +1028,96 @@ static double parakeet_ms_per_enc_frame(const ParakeetHParams & hp) {
            static_cast<double>(hp.fe_sample_rate);
 }
 
+// Logit bonus per matched vocabulary token after a term's first, in
+// natural-log units. The lowest value that kept the term-recall gains while
+// leaving transcripts of unrelated speech unchanged; see docs/prompting.md.
+constexpr float kVocabularyBoost = 3.0f;
+
+// `term` with the case of its first letter flipped ("Postgres" ->
+// "postgres"), or "" when it does not start with an ASCII letter. Sentence
+// position decides that letter's case in the transcript, not the term list.
+static std::string flip_first_letter(const std::string & term) {
+    std::string out = transcribe::prompting::strip(term);
+    if (out.empty()) {
+        return "";
+    }
+    const char c = out[0];
+    if (c >= 'a' && c <= 'z') {
+        out[0] = static_cast<char>(c - 'a' + 'A');
+    } else if (c >= 'A' && c <= 'Z') {
+        out[0] = static_cast<char>(c - 'A' + 'a');
+    } else {
+        return "";
+    }
+    return out;
+}
+
+// The phrase-boost automaton for this run's vocabulary, or nullptr when the
+// run has none. Terms are tokenized as the model writes them (with the word
+// boundary marker), so a term matches only from the start of a word. Each
+// term also matches with its first letter's case flipped.
+static const transcribe::PhraseBoost * vocabulary_boost(ParakeetSession *             pc,
+                                                        const ParakeetModel *         pm,
+                                                        const transcribe_run_params * params) {
+    std::vector<std::string> terms = transcribe::prompting::terms(params);
+    float                    bonus = kVocabularyBoost;
+    // Offline runs boost the (validated) PARAKEET_RUN phrases as vocabulary
+    // terms; streams keep the extension's trie.
+    if (params != nullptr && params->family != nullptr) {
+        const auto * px = reinterpret_cast<const transcribe_parakeet_run_ext *>(params->family);
+        if (px->n_boost_phrases > 0 && px->boost_score > 0.0f) {
+            for (int32_t i = 0; i < px->n_boost_phrases; ++i) {
+                if (!transcribe::prompting::strip(px->boost_phrases[i]).empty()) {
+                    terms.emplace_back(px->boost_phrases[i]);
+                }
+            }
+            bonus = px->boost_score;
+        }
+    }
+    if (terms.empty() || pm->host_decoder.head_kind == HostHeadKind::CTC) {
+        return nullptr;
+    }
+    if (terms != pc->vocab_terms || bonus != pc->vocab_bonus || pc->vocab_boost.empty()) {
+        std::vector<std::vector<int32_t>> phrases;
+        for (const std::string & term : terms) {
+            std::vector<int32_t> ids;
+            if (pm->tok.encode_sentencepiece_bpe(term, ids, 0, -1, /*remove_extra_whitespaces=*/true) !=
+                TRANSCRIBE_OK) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                        "parakeet: this tokenizer cannot encode vocabulary terms; ignoring them");
+                return nullptr;
+            }
+            bool unknown = false;
+            for (const int32_t id : ids) {
+                unknown = unknown || pm->tok.is_unknown(id);
+            }
+            if (unknown) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                        "parakeet: vocabulary term '%s' has characters the model cannot write; skipped", term.c_str());
+                continue;
+            }
+            phrases.push_back(std::move(ids));
+
+            const std::string flipped = flip_first_letter(term);
+            if (!flipped.empty() &&
+                pm->tok.encode_sentencepiece_bpe(flipped, ids, 0, -1,
+                                                 /*remove_extra_whitespaces=*/true) == TRANSCRIBE_OK) {
+                bool flipped_unknown = false;
+                for (const int32_t id : ids) {
+                    flipped_unknown = flipped_unknown || pm->tok.is_unknown(id);
+                }
+                if (!flipped_unknown) {
+                    phrases.push_back(std::move(ids));
+                }
+            }
+        }
+        pc->vocab_boost.build(phrases, bonus);
+        pc->vocab_terms = std::move(terms);
+        pc->vocab_bonus = bonus;
+    }
+    return pc->vocab_boost.empty() ? nullptr : &pc->vocab_boost;
+}
+
 // Host-side TDT/RNNT/CTC decode + public result-hierarchy build for one
 // utterance's encoder output. `enc` is the row-major [T_enc, d_enc]
 // activation for ONE utterance; utt_index >= 0 tags the per-utterance
@@ -1055,16 +1151,17 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
     }
 
     pc->raw_tokens.clear();
-    const BoostTrie * boost       = pc->boost.empty() ? nullptr : &pc->boost;
-    const int64_t     t_dec_start = ggml_time_us();
+    const int64_t t_dec_start = ggml_time_us();
     {
         transcribe_status st = TRANSCRIBE_OK;
         switch (pm->host_decoder.head_kind) {
             case HostHeadKind::TDT:
-                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, boost, pc->raw_tokens);
+                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens,
+                                       vocabulary_boost(pc, pm, params));
                 break;
             case HostHeadKind::RNNT:
-                st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, boost, pc->raw_tokens);
+                st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens,
+                                        vocabulary_boost(pc, pm, params));
                 break;
             case HostHeadKind::CTC:
                 st = decode_ctc_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
@@ -2054,7 +2151,6 @@ transcribe_status run(transcribe_session *          session,
     }
 
     pc->clear_result();
-    compile_boost(pc, pm, params);
 
     // Multitalker bundle: diarize=ON routes through the embedded-sortformer
     // orchestrator (per-speaker passes + merged speaker-tagged result).
@@ -2447,7 +2543,6 @@ transcribe_status run_batch(transcribe_session *          session,
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     transcribe::debug::init();
-    compile_boost(pc, pm, params);
 
     // Multitalker is a transcribe_run concern for now: batch keeps the
     // shipped single-speaker semantics even on a bundle model. Warn so a
@@ -3801,6 +3896,15 @@ transcribe_status stream_begin(transcribe_session *             session,
     }
 
     pc->stream_audio_input_samples = 0;
+
+    // Vocabulary biasing is wired into the offline decoders only; say so
+    // rather than drop the terms silently.
+    if (run_params->n_vocabulary > 0) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                "parakeet: vocabulary terms are not applied on the streaming API yet; ignoring %d term(s) "
+                "(use transcribe_run)",
+                run_params->n_vocabulary);
+    }
 
     // -------- Buffered streaming path (parakeet-unified-en-0.6b) --------
     //

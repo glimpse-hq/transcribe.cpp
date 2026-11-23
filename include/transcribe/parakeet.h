@@ -128,11 +128,13 @@ TRANSCRIBE_API void transcribe_parakeet_buffered_stream_ext_init(struct transcri
  *     Boost weight in logits per phrase-trie arc score. Default 3.0;
  *     0 disables. Must be finite and in [0, 10].
  *
- * Greedy decoding keeps the model's blank decisions. A boosted token must
- * have at least 1e-5 unboosted probability, and a swap is kept only when
- * it completes a phrase as whole words and the decode keeps emitting
- * speech for half a second after it; otherwise the model's own tokens
- * stand for that span.
+ * Offline runs boost the phrases as transcribe_run_params::vocabulary
+ * terms (see docs/prompting.md), with boost_score as the per-token bonus.
+ * Streams keep the model's blank decisions; a boosted token must have at
+ * least 1e-5 unboosted probability, and a swap is kept only when it
+ * completes a phrase as whole words and the decode keeps emitting speech
+ * for half a second after it; otherwise the model's own tokens stand for
+ * that span.
  */
 struct transcribe_parakeet_run_ext {
     struct transcribe_ext ext;
