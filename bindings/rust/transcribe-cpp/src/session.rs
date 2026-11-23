@@ -122,10 +122,9 @@ impl Session {
         // Owned for the duration of the init call; the library copies nothing
         // and reads the path only during session init.
         let coreml_path = match &options.coreml_encoder_path {
-            Some(path) => Some(
-                CString::new(crate::model::path_bytes(path)?)
-                    .map_err(|_| Error::InvalidArgument("coreml_encoder_path contains a NUL byte".into()))?,
-            ),
+            Some(path) => Some(CString::new(crate::model::path_bytes(path)?).map_err(|_| {
+                Error::InvalidArgument("coreml_encoder_path contains a NUL byte".into())
+            })?),
             None => None,
         };
         if let Some(path) = &coreml_path {

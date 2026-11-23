@@ -733,7 +733,7 @@ transcribe_status init_context(transcribe_model *                model,
 
     if (const char * path = transcribe::session_coreml_encoder_path(params, "TRANSCRIBE_PARAKEET_COREML_MODEL")) {
 #ifdef TRANSCRIBE_COREML
-        const auto & hp = static_cast<ParakeetModel *>(model)->hparams;
+        const auto & hp      = static_cast<ParakeetModel *>(model)->hparams;
         // The long-form window only applies to the ggml encoder; Core ML runs the full-attention encoder.
         const bool local_att = !hp.enc_att_longform && (hp.enc_att_context_left >= 0 || hp.enc_att_context_right >= 0);
         if (hp.enc_subsampling_factor != 8 || hp.enc_conv_norm_type != ParakeetHParams::ConvNormType::BatchNorm ||
