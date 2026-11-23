@@ -62,10 +62,9 @@ pub struct WhisperRunOptions {
     pub greedy_prompt_tokens: Option<bool>,
 }
 
-/// Parakeet phrase boosting (run slot; also applied by `stream`). Offline
-/// runs boost the phrases as vocabulary terms; streams match them as typed
-/// (casing matters). `boost_score: None` keeps the library default (3.0);
-/// an empty list disables boosting.
+/// Parakeet phrase boosting (run slot; also applied by `stream`). Phrases
+/// are matched as typed (casing matters). `boost_score: None` keeps the
+/// library default (3.0); an empty list disables boosting.
 #[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(
     feature = "serde",

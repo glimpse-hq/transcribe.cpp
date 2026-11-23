@@ -323,18 +323,14 @@ struct ParakeetSession final : public transcribe_session {
     ggml_tensor * encoder_out = nullptr;
 
     // Per-context scratch reused across runs.
-    std::vector<float>       mel_buf;
-    std::vector<float>       pos_buf;
-    std::vector<float>       pos_div_term;
-    std::vector<float>       enc_host;
-    std::vector<TdtToken>    raw_tokens;
-    // Offline vocabulary biasing, rebuilt only when the run's terms change.
-    std::vector<std::string> vocab_terms;
-    float                    vocab_bonus = 0.0f;
-    transcribe::PhraseBoost  vocab_boost;
+    std::vector<float>    mel_buf;
+    std::vector<float>    pos_buf;
+    std::vector<float>    pos_div_term;
+    std::vector<float>    enc_host;
+    std::vector<TdtToken> raw_tokens;
 
     // Phrase-boosting trie compiled from the PARAKEET_RUN extension by
-    // stream_begin; empty = plain greedy.
+    // run / run_batch / stream_begin; empty = plain greedy.
     BoostTrie boost;
 
     // Multitalker bundle scratch: streaming-diarizer AOSC/FIFO state for
